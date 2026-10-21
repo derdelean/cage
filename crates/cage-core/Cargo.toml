@@ -3,7 +3,7 @@ name = "cage-core"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Dennis Erdelean <dennis.erdelean@proton.me>"]
+authors = ["Dennis Erdelean <dennis.erdelean@gmail.com>"]
 description = "CAGE core — pure-Rust credential vault, capability gating, append-only audit chain, and zero-plaintext transport. The single audited core shared by the PyO3 extension and the credential broker."
 
 [dependencies]

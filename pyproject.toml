@@ -9,7 +9,7 @@ description = "CAGE: credential containment for AI agents. Capability-token-gate
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Dennis Erdelean", email = "dennis.erdelean@proton.me" }
+    { name = "Dennis Erdelean", email = "dennis.erdelean@gmail.com" }
 ]
 keywords = ["security", "cryptography", "ai-agents", "capability-tokens"]
 classifiers = [

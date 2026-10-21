@@ -3,7 +3,7 @@ name = "cage-broker"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Dennis Erdelean <dennis.erdelean@proton.me>"]
+authors = ["Dennis Erdelean <dennis.erdelean@gmail.com>"]
 description = "CAGE credential broker: runs the cage-core vault and capability authority in a separate process. Agents hold short-lived capability tokens over a Unix socket and never the key. Structural refusal is enforced broker-side."
 
 [lib]
