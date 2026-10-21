@@ -3,8 +3,8 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "cage"
-version = "0.1.0"
+name = "cage-ai"
+version = "0.1.1"
 description = "CAGE: credential containment for AI agents. Capability-token-gated, structurally refusing, audit-chained."
 readme = "README.md"
 license = { file = "LICENSE" }

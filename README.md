@@ -118,19 +118,25 @@ To verify a downloaded wheel before installing:
 
 ```bash
 cosign verify-blob \
-  --certificate cage-X.Y.Z-*.whl.cert \
-  --signature   cage-X.Y.Z-*.whl.sig \
+  --certificate cage_ai-X.Y.Z-*.whl.cert \
+  --signature   cage_ai-X.Y.Z-*.whl.sig \
   --certificate-identity-regexp \
     "https://github.com/derdelean/cage/\.github/workflows/release\.yml@.*" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  cage-X.Y.Z-*.whl
+  cage_ai-X.Y.Z-*.whl
 ```
 
-A passing verification proves the wheel was built by this repository's release workflow at the tagged commit, and the proof is publicly recorded in Rekor. CAGE proposes credential containment through capability tokens and an audit chain, and its own releases are signed with the same Sigstore, Fulcio and Rekor model.
+A passing verification proves the wheel was built by this repository's release workflow at the tagged commit, and the proof is publicly recorded in Rekor. The same workflow publishes to PyPI through trusted publishing (no API token), and PyPI shows a Sigstore attestation for each file. CAGE proposes credential containment through capability tokens and an audit chain, and its own releases are signed with the same Sigstore, Fulcio and Rekor model.
 
 ## Installing
 
-CAGE is not on PyPI yet. Install a signed wheel from [GitHub Releases](https://github.com/derdelean/cage/releases) (verify it first, as above), or build from source:
+From PyPI (the distribution is named `cage-ai`, the import stays `import cage`):
+
+```bash
+pip install cage-ai
+```
+
+Or install a signed wheel from [GitHub Releases](https://github.com/derdelean/cage/releases) (verify it first, as above), or build from source:
 
 ```bash
 uv pip install maturin
@@ -142,8 +148,8 @@ A bare `import cage` (the authority core) needs no native extension. The vault a
 To use CAGE from another local project, build a wheel and install it:
 
 ```bash
-maturin build --release                      # -> target/wheels/cage-0.1.0-*.whl
-pip install target/wheels/cage-0.1.0-*.whl
+maturin build --release                      # -> target/wheels/cage_ai-0.1.1-*.whl
+pip install target/wheels/cage_ai-0.1.1-*.whl
 ```
 
 or reference the checkout as a path dependency:
@@ -151,7 +157,7 @@ or reference the checkout as a path dependency:
 ```toml
 # pyproject.toml of the consuming project (uv)
 [tool.uv.sources]
-cage = { path = "../cage" }
+cage-ai = { path = "../cage" }
 ```
 
 Locally built wheels are not signed.

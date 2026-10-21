@@ -20,8 +20,8 @@ Two import tiers (Option C — progressive enhancement):
   * The secret-custody + zero-plaintext transport ring (``SecretVault`` and the
     module-level ``vault`` singleton) is imported **lazily** on first access via
     PEP 562 ``__getattr__``. Only then is ``cage.vault`` imported and its
-    dependencies touched (the bundled native extension, or the ``cage[vault]`` /
-    ``cage[anthropic]`` pure-Python fallback). A bare ``import cage`` never
+    dependencies touched (the bundled native extension, or the ``cage-ai[vault]`` /
+    ``cage-ai[anthropic]`` pure-Python fallback). A bare ``import cage`` never
     imports it — that is what keeps the core dependency-free.
 
 Apache 2.0 with a defensive-only patent pledge (see PATENT_PLEDGE.md).
@@ -45,7 +45,7 @@ __all__ = [
     "vault",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Ring 2 (secret custody) is exposed lazily so it — and its native / cryptography
 # dependencies — is never imported by a bare ``import cage``. Resolving either

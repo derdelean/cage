@@ -3,18 +3,19 @@ name: release
 # Sigstore-signed release pipeline.
 #
 # When a tag v* is pushed:
-#   1. Build manylinux + macOS wheels via maturin (Python 3.11–3.14)
+#   1. Build manylinux + macOS wheels via maturin (Python 3.11–3.14) and an sdist
 #   2. Sign every wheel via cosign with GitHub Actions OIDC + Fulcio
-#      (keyless — no long-lived signing keys live in this repo or in CI)
+#      (keyless: no long-lived signing key lives in this repo or in CI)
 #   3. Publish a GitHub Release with the wheels alongside their .sig + .cert files
-#   4. Each signature is anchored automatically in the public Sigstore Rekor
-#      transparency log; verification proves the wheel was built by THIS
-#      repository's release.yml at the tagged commit.
+#   4. Each signature is recorded in the public Sigstore Rekor transparency log.
+#      Verification proves the wheel was built by THIS repository's release.yml
+#      at the tagged commit.
+#   5. Publish the wheels and the sdist to PyPI as cage-ai through trusted
+#      publishing (OIDC, no API token). PyPI attaches a Sigstore attestation.
 #
-# Narrative consistency: cage proposes credential containment via
-# capability tokens + audit chain. Our own releases are signed via the
-# same Sigstore/Fulcio/Rekor model — "we sign our releases via the same
-# infrastructure we propose for protecting your agents."
+# cage proposes credential containment through capability tokens and an audit
+# chain, and its own releases are signed with the same Sigstore, Fulcio and
+# Rekor model.
 
 on:
   push:
@@ -137,28 +138,75 @@ jobs:
         with:
           name: ${{ github.ref_name }}
           body: |
-            CAGE ${{ github.ref_name }} — Sigstore-signed release.
+            CAGE ${{ github.ref_name }}, Sigstore-signed. Also on PyPI as `cage-ai`.
 
-            Every wheel below is signed via Sigstore (keyless OIDC + Fulcio),
-            with the signature anchored in the public Rekor transparency log.
+            Every wheel below is signed with Sigstore (keyless OIDC and Fulcio),
+            and the signature is recorded in the public Rekor transparency log.
 
             **Verify before installing:**
 
             ```bash
             cosign verify-blob \
-              --certificate cage-*.whl.cert \
-              --signature   cage-*.whl.sig \
+              --certificate cage_ai-*.whl.cert \
+              --signature   cage_ai-*.whl.sig \
               --certificate-identity-regexp \
                 "https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@.*" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              cage-*.whl
+              cage_ai-*.whl
             ```
 
-            A passing verification proves this wheel was built by this
-            repository's release workflow at the tagged commit, recorded in
-            Rekor.
+            A passing verification proves the wheel was built by this
+            repository's release workflow at the tagged commit, and the proof
+            is recorded in Rekor.
           files: |
             signed/*.whl
             signed/*.sig
             signed/*.cert
           fail_on_unmatched_files: true
+
+  sdist:
+    name: build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    name: publish to PyPI
+    # Only files that passed signing and the GitHub release go to PyPI.
+    needs: [sign-and-release, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cage-ai/
+    permissions:
+      id-token: write   # PyPI trusted publishing over OIDC, no API token
+
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Publish (trusted publishing, PEP 740 attestations)
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
