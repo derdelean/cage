@@ -1,0 +1,14 @@
+# CODEOWNERS for cage
+#
+# The load-bearing crypto surface. Takes effect once branch protection
+# requires code-owner review.
+
+# Pure-Rust crypto core: authority, secret and transport surface.
+/crates/cage-core/src/vault.rs       @derdelean
+/crates/cage-core/src/gate.rs        @derdelean
+/crates/cage-core/src/transport.rs   @derdelean
+/crates/cage-core/src/release.rs     @derdelean
+/crates/cage-core/src/operator.rs    @derdelean
+
+# PyO3 authority shell (RustGate, authority and secret co-located).
+/src/lib.rs                          @derdelean

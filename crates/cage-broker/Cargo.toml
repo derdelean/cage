@@ -1,0 +1,29 @@
+[package]
+name = "cage-broker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Dennis Erdelean <dennis.erdelean@proton.me>"]
+description = "CAGE credential broker: runs the cage-core vault and capability authority in a separate process. Agents hold short-lived capability tokens over a Unix socket and never the key. Structural refusal is enforced broker-side."
+
+[lib]
+name = "cage_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cage-broker"
+path = "src/main.rs"
+
+[dependencies]
+cage-core = { path = "../cage-core" }
+serde = { version = "1.0", features = ["derive"] }
+# Decode the control-plane auth fields (operator key_id / nonce / signature hex).
+hex = "0.4"
+# raw_value: forward the LLM body to the provider byte-for-byte (no key reorder /
+# number canonicalization / duplicate-key collapse from a Value round-trip).
+serde_json = { version = "1.0", features = ["raw_value"] }
+
+[target.'cfg(unix)'.dependencies]
+# Socket peer-credential check (refuse non-allowlisted UIDs): SO_PEERCRED on Linux,
+# getpeereid(2) on macOS/BSD.
+libc = "0.2"

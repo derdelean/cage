@@ -1,0 +1,42 @@
+[package]
+name = "cage"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Dennis Erdelean <dennis.erdelean@proton.me>"]
+repository = "https://github.com/derdelean/cage"
+description = "CAGE (Credential-bound Agent Gating Engine): capability tokens, structural refusal and an append-only audit chain for AI agents, over a ChaCha20Poly1305 vault with zeroize-on-drop and mlock."
+readme = "README.md"
+keywords = ["security", "cryptography", "ai-agents", "capability-tokens"]
+categories = ["cryptography", "authentication", "api-bindings"]
+
+[workspace]
+members = [
+    "crates/cage-core",
+    "crates/cage-broker",
+]
+
+[lib]
+name = "_cage_native"
+crate-type = ["cdylib"]
+
+# The root crate is the thin PyO3 binding layer (`cage._cage_native`). All
+# crypto / vault / transport logic lives in the pure-Rust `cage-core` crate so
+# the same core also runs in the standalone `cage-broker` binary with no PyO3
+# present.
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+cage-core = { path = "crates/cage-core" }
+# For the opaque `Bootstrap` handle: holds the unsealed secret in zero-on-drop
+# memory so it never crosses PyO3 as a Python `str`. Matches cage-core's pin.
+zeroize = "1.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+# Turn any *missed* integer overflow into a loud panic rather than a silent wrap —
+# defense in depth for this security-load-bearing crate (the parsing paths use
+# checked arithmetic regardless).
+overflow-checks = true

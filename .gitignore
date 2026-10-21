@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+build/
+dist/
+wheelhouse/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Maturin
+*.so
+*.pyd
+*.dylib
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Personal notes & exported conversation history — never push
+all-notes-*.txt
+conversation-*.md
+conversation-*.txt
+release-prep/
+
+# Claude Code local state (settings, scheduler, locks) — never push
+.claude/

@@ -1,0 +1,15 @@
+# Pin the toolchain so a local check is the SAME check CI runs.
+#
+# Why this file exists: on 2026-08-10 a `clippy::for_kv_map` error failed every CI
+# job while local `cargo clippy -- -D warnings` reported clean. The local default was
+# an older toolchain than CI's stable, and the lint simply did not exist in it — so
+# "clippy clean" locally was a weaker gate than the one that blocks a merge. Tracking
+# `stable` on both sides is not enough: two machines resolve `stable` to whatever they
+# last downloaded. An exact version is the only thing that makes local and CI agree.
+#
+# Bump deliberately, and bump BOTH places: this file and the `toolchain:` input in
+# .github/workflows/build.yml. Run `cargo clippy --workspace --all-targets -- -D warnings`
+# after bumping — a newer toolchain means new lints, which is the point.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
