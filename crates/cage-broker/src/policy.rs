@@ -8,11 +8,18 @@
 //! the default: a typo must not loosen the ceiling it was meant to tighten. So is a
 //! number set without `CAGE_ISSUANCE_SCOPES`, which would otherwise leave the
 //! process with no policy at all.
+//!
+//! Any other variable whose name starts with `CAGE_ISSUANCE_`, in any case, is an
+//! error as well. Read alone, a misspelled name would be ignored: no policy for the
+//! scope list, the default for a limit, no cap for the cap. A misspelling outside
+//! that prefix is not caught.
 
 use std::env::VarError;
 
 use cage_core::IssuancePolicy;
 
+const PREFIX: &str = "CAGE_ISSUANCE_";
+const SCOPES_KEY: &str = "CAGE_ISSUANCE_SCOPES";
 const NUMBER_KEYS: [&str; 3] = [
     "CAGE_ISSUANCE_MAX_TTL",
     "CAGE_ISSUANCE_MAX_USES",
@@ -20,15 +27,21 @@ const NUMBER_KEYS: [&str; 3] = [
 ];
 
 /// The issuance policy the environment provisions, `Ok(None)` when
-/// `CAGE_ISSUANCE_SCOPES` is unset, or an error naming the malformed variable.
+/// `CAGE_ISSUANCE_SCOPES` is unset, or an error naming the malformed or unknown
+/// variable.
 pub fn issuance_policy_from_env() -> Result<Option<IssuancePolicy>, String> {
-    parse_issuance_policy(|key| std::env::var(key))
+    let names: Vec<String> = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    parse_issuance_policy(&names, |key| std::env::var(key))
 }
 
 fn parse_issuance_policy(
+    names: &[String],
     var: impl Fn(&str) -> Result<String, VarError>,
 ) -> Result<Option<IssuancePolicy>, String> {
-    let Some(raw) = read(&var, "CAGE_ISSUANCE_SCOPES")? else {
+    reject_unknown_names(names)?;
+    let Some(raw) = read(&var, SCOPES_KEY)? else {
         for key in NUMBER_KEYS {
             if read(&var, key)?.is_some() {
                 return Err(format!(
@@ -53,6 +66,21 @@ fn parse_issuance_policy(
         max_uses,
         max_tokens_per_scope,
     }))
+}
+
+/// An error naming the first variable that carries the policy prefix but is not a
+/// policy variable.
+fn reject_unknown_names(names: &[String]) -> Result<(), String> {
+    for name in names {
+        let known = name == SCOPES_KEY || NUMBER_KEYS.contains(&name.as_str());
+        if !known && name.to_ascii_uppercase().starts_with(PREFIX) {
+            return Err(format!(
+                "{name} is not an issuance policy variable (known: {SCOPES_KEY}, {})",
+                NUMBER_KEYS.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `Ok(None)` only when `key` is unset. A value that is not UTF-8 is an error.
@@ -91,7 +119,10 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        parse_issuance_policy(|key| map.get(key).cloned().ok_or(VarError::NotPresent))
+        let names: Vec<String> = map.keys().cloned().collect();
+        parse_issuance_policy(&names, |key| {
+            map.get(key).cloned().ok_or(VarError::NotPresent)
+        })
     }
 
     #[test]
@@ -162,8 +193,54 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_policy_variable_is_refused() {
+        // Each would otherwise be ignored: no policy, the default use limit, no cap,
+        // no policy.
+        for (vars, unknown) in [
+            (
+                &[("CAGE_ISSUANCE_SCOPE", "sign.")][..],
+                "CAGE_ISSUANCE_SCOPE",
+            ),
+            (
+                &[
+                    ("CAGE_ISSUANCE_SCOPES", "sign."),
+                    ("CAGE_ISSUANCE_MAX_USE", "2"),
+                ][..],
+                "CAGE_ISSUANCE_MAX_USE",
+            ),
+            (
+                &[
+                    ("CAGE_ISSUANCE_SCOPES", "sign."),
+                    ("CAGE_ISSUANCE_MAX_TOKENS", "10"),
+                ][..],
+                "CAGE_ISSUANCE_MAX_TOKENS",
+            ),
+            (
+                &[("cage_issuance_scopes", "sign.")][..],
+                "cage_issuance_scopes",
+            ),
+        ] {
+            let err = parse(vars).unwrap_err();
+            assert!(err.contains(unknown), "{vars:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn other_cage_variables_are_not_policy_variables() {
+        let policy = parse(&[
+            ("CAGE_ISSUANCE_SCOPES", "sign."),
+            ("CAGE_LLM_PROVIDER", "anthropic"),
+            ("CAGE_BROKER_SECRET_FILE", "/tmp/x"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(policy.allowed_scopes, ["sign."]);
+    }
+
+    #[test]
     fn non_utf8_scopes_are_refused_not_treated_as_unset() {
-        let result = parse_issuance_policy(|key| match key {
+        let names = [SCOPES_KEY.to_string()];
+        let result = parse_issuance_policy(&names, |key| match key {
             "CAGE_ISSUANCE_SCOPES" => Err(VarError::NotUnicode(OsString::from("x"))),
             _ => Err(VarError::NotPresent),
         });
