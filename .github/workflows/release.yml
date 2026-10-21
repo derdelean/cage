@@ -54,11 +54,14 @@ jobs:
           source .venv/bin/activate
           uv pip install maturin
 
+      # Built inside the manylinux_2_28 container: the runner's own glibc is newer
+      # than the manylinux_2_28 tag allows, so a native build fails the check.
       - name: Build wheel (manylinux on Linux)
         if: runner.os == 'Linux'
-        run: |
-          source .venv/bin/activate
-          maturin build --release --strip --manylinux 2_28 -i python${{ matrix.python-version }}
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          manylinux: 2_28
+          args: --release --strip -i python${{ matrix.python-version }}
 
       - name: Build wheel (macOS)
         if: runner.os == 'macOS'
