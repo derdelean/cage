@@ -49,6 +49,7 @@ fn main() {
         eprintln!("[cage-broker] FATAL: issuance policy: {e}");
         std::process::exit(1);
     });
+    let policy_waived = policy.is_none();
     let mut gate = match policy {
         Some(policy) => {
             let scopes = policy.allowed_scopes.len();
@@ -87,19 +88,12 @@ fn main() {
     // chain without this entry came from a broker that denied debugger attach. A
     // waived broker's memory is readable, so this holds only up to the first anchor.
     if allow_debugger {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        gate.append_audit(
-            "broker".to_string(),
-            "debugger_attach_allowed".to_string(),
-            "{}".to_string(),
-            now.to_string(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("[cage-broker] FATAL: cannot record the debugger waiver: {e}");
-            std::process::exit(1);
-        });
+        record_waiver(&mut gate, "debugger_attach_allowed");
+    }
+    // Likewise for the policy waiver: the chain itself then shows that this broker
+    // ran without an issuance ceiling by request.
+    if policy_waived {
+        record_waiver(&mut gate, "issuance_policy_waived");
     }
 
     // Load the signing credential from a SEALED SOURCE, never from an environment
@@ -205,4 +199,22 @@ fn main() {
         eprintln!("[cage-broker] fatal: {e}");
         std::process::exit(1);
     }
+}
+
+/// Append a start-up waiver to the audit chain, or stop the broker: a waived broker
+/// whose chain does not say so would pass for one without the waiver.
+fn record_waiver(gate: &mut Gate, event: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    gate.append_audit(
+        "broker".to_string(),
+        event.to_string(),
+        "{}".to_string(),
+        now.to_string(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("[cage-broker] FATAL: cannot record {event} on the audit chain: {e}");
+        std::process::exit(1);
+    });
 }

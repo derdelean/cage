@@ -1,13 +1,15 @@
 //! The frozen issuance policy, read from the environment at start-up.
 //!
-//!   CAGE_ISSUANCE_SCOPES=llm.,sign.   (comma-separated; unset disables the policy)
+//!   CAGE_ISSUANCE_SCOPES=llm.,sign.   (comma-separated, at least one scope)
 //!   CAGE_ISSUANCE_MAX_TTL=300  CAGE_ISSUANCE_MAX_USES=10
 //!   CAGE_ISSUANCE_MAX_TOKENS_PER_SCOPE=1000   (optional lifetime cap per entry)
 //!
 //! An unset number takes its default. A set but malformed value is an error, never
 //! the default: a typo must not loosen the ceiling it was meant to tighten. So is a
 //! number set without `CAGE_ISSUANCE_SCOPES`, which would otherwise leave the
-//! process with no policy at all.
+//! process with no policy at all, and a scope list that names no scope. Unset
+//! `CAGE_ISSUANCE_SCOPES` means no policy, which the broker refuses unless the
+//! operator waives it.
 //!
 //! Any other variable whose name starts with `CAGE_ISSUANCE_`, in any case, is an
 //! error as well. Read alone, a misspelled name would be ignored: no policy for the
@@ -60,6 +62,11 @@ fn parse_issuance_policy(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    if allowed_scopes.is_empty() {
+        // An empty variable, for example from an unset shell variable, would freeze a
+        // policy that admits nothing and let the process start anyway.
+        return Err(format!("{SCOPES_KEY}={raw:?} names no scope"));
+    }
     let max_ttl_seconds = number(&var, MAX_TTL_KEY)?.unwrap_or(300);
     let max_uses = number(&var, MAX_USES_KEY)?.unwrap_or(50);
     let max_tokens_per_scope = number(&var, MAX_TOKENS_KEY)?;
@@ -234,7 +241,15 @@ mod tests {
             ),
         ] {
             let err = parse(vars).unwrap_err();
-            assert!(err.contains(unknown), "{vars:?}: {err}");
+            assert!(err.contains(&format!("{unknown:?}")), "{vars:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_scope_list_without_a_scope_is_refused() {
+        for raw in ["", " ", ",", " , ,"] {
+            let err = parse(&[("CAGE_ISSUANCE_SCOPES", raw)]).unwrap_err();
+            assert!(err.contains("names no scope"), "{raw:?}: {err}");
         }
     }
 

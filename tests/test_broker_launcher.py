@@ -188,6 +188,22 @@ def test_inherited_debugger_waiver_is_not_forwarded(tmp_path, monkeypatch):
     assert _broker_env(tmp_path)["CAGE_BROKER_ALLOW_DEBUGGER"] == "1"
 
 
+def test_inherited_policy_waiver_is_not_forwarded(tmp_path, monkeypatch):
+    # A waiver left in a shell profile must not hide a missing or misspelled
+    # policy. Only allow_no_policy=True passes it, in any case of the name.
+    fake = _write_fake_broker(tmp_path, _ENV_RECORDING_BROKER)
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
+    monkeypatch.setenv("cage_broker_allow_no_policy", "1")
+    with spawn_broker(fake, signing_key="sk-test"):
+        pass
+    env = _broker_env(tmp_path)
+    assert "CAGE_BROKER_ALLOW_NO_POLICY" not in env
+    assert "cage_broker_allow_no_policy" not in env
+    with spawn_broker(fake, signing_key="sk-test", allow_no_policy=True):
+        pass
+    assert _broker_env(tmp_path)["CAGE_BROKER_ALLOW_NO_POLICY"] == "1"
+
+
 def test_only_cage_settings_reach_the_broker_environment(tmp_path, monkeypatch):
     # A provider key or a preload in the caller's environment stays out of the
     # broker's environment block. The broker's own CAGE_* settings pass.
@@ -195,12 +211,15 @@ def test_only_cage_settings_reach_the_broker_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-for-the-broker")
     monkeypatch.setenv("LD_PRELOAD", "/nonexistent/inject.so")
     monkeypatch.setenv("CAGE_ISSUANCE_SCOPES", "sign.")
+    monkeypatch.setenv("cage_issuance_max_uses", "2")
     with spawn_broker(fake, signing_key="sk-test"):
         pass
     env = _broker_env(tmp_path)
     assert "ANTHROPIC_API_KEY" not in env
     assert "LD_PRELOAD" not in env
     assert env["CAGE_ISSUANCE_SCOPES"] == "sign."
+    # A miscased CAGE_ name passes too, so the broker can refuse it.
+    assert env["cage_issuance_max_uses"] == "2"
     # Nothing else of the caller's either. (The fake broker is a Python interpreter,
     # which adds a few locale variables of its own on startup.)
     assert "PATH" not in env and "HOME" not in env
@@ -260,6 +279,12 @@ def test_harden_launcher_denies_core_dumps_and_attach():
 def test_allow_debugger_must_be_a_bool(value):
     with pytest.raises(CageViolation, match="allow_debugger must be a bool"):
         spawn_broker("unused", signing_key="sk-test", allow_debugger=value)
+
+
+@pytest.mark.parametrize("value", ["false", 1, None])
+def test_allow_no_policy_must_be_a_bool(value):
+    with pytest.raises(CageViolation, match="allow_no_policy must be a bool"):
+        spawn_broker("unused", signing_key="sk-test", allow_no_policy=value)
 
 
 def test_refusal_message_is_not_double_prefixed():
@@ -323,12 +348,13 @@ def _issue_and_invoke(bp, provider):
 
 
 @_needs_broker
-def test_provider_key_registers_llm_scope(monkeypatch):
+def test_provider_key_registers_llm_scope():
     # With a provider key supplied, an llm-scoped token resolves to it and reaches
     # provider validation: an UNKNOWN provider is rejected there (network-free),
     # proving scope->secret resolution + the invoke verb — not a missing secret.
-    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
-    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake") as bp:
+    with spawn_broker(
+        _BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake", allow_no_policy=True,
+    ) as bp:
         with pytest.raises(BrokerError, match="unknown provider"):
             _issue_and_invoke(bp, "no-such-provider")
 
@@ -338,12 +364,13 @@ def _audit_events(bp) -> list[str]:
 
 
 @_needs_broker
-def test_debugger_waiver_is_recorded_on_the_audit_chain(monkeypatch):
+def test_debugger_waiver_is_recorded_on_the_audit_chain():
     # A chain without the entry came from a broker that denied debugger attach.
-    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
-    with spawn_broker(_BROKER_BIN, signing_key="sk-sign") as bp:
+    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", allow_no_policy=True) as bp:
         assert "debugger_attach_allowed" not in _audit_events(bp)
-    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", allow_debugger=True) as bp:
+    with spawn_broker(
+        _BROKER_BIN, signing_key="sk-sign", allow_debugger=True, allow_no_policy=True,
+    ) as bp:
         assert "debugger_attach_allowed" in _audit_events(bp)
 
 
@@ -352,30 +379,51 @@ def test_llm_provider_pin_refuses_another_provider(monkeypatch):
     # CAGE_LLM_PROVIDER pins the broker's LLM key: a token cannot send it to another
     # provider's host. Refused before any network call.
     monkeypatch.setenv("CAGE_LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
-    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake") as bp:
+    with spawn_broker(
+        _BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake", allow_no_policy=True,
+    ) as bp:
         with pytest.raises(CageViolation, match="pinned to provider"):
             _issue_and_invoke(bp, "openai")
 
 
 @_needs_broker
-def test_sign_only_broker_does_not_register_llm_scope(monkeypatch):
+def test_sign_only_broker_does_not_register_llm_scope():
     # Without a provider key the llm. scope is never registered, so an llm-scoped
     # token does not resolve — refused before any network.
-    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
-    with spawn_broker(_BROKER_BIN, signing_key="sk-sign") as bp:
+    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", allow_no_policy=True) as bp:
         with pytest.raises(CageViolation, match="unknown scope namespace"):
             _issue_and_invoke(bp, "anthropic")
 
 
 @_needs_broker
-def test_broker_without_a_policy_refuses_to_start(monkeypatch, capfd):
-    # spawn_broker forwards only CAGE_* names, so the lowercase one never reaches the
-    # broker. The broker sees no policy and refuses, as for any misspelled scope list.
-    monkeypatch.delenv("CAGE_BROKER_ALLOW_NO_POLICY", raising=False)
-    monkeypatch.delenv("CAGE_ISSUANCE_SCOPES", raising=False)
-    monkeypatch.setenv("cage_issuance_scopes", "sign.")
+def test_broker_without_a_policy_refuses_to_start(capfd):
     with pytest.raises(BrokerError, match="did not reveal its attestation pubkey"):
         with spawn_broker(_BROKER_BIN, signing_key="sk-sign"):
             pass
     assert "FATAL: no issuance policy" in capfd.readouterr().err
+
+
+@_needs_broker
+def test_a_miscased_policy_name_reaches_the_broker_and_is_refused(monkeypatch, capfd):
+    # Read alone, the lowercase limit would leave the default of 50 uses in force.
+    monkeypatch.setenv("CAGE_ISSUANCE_SCOPES", "sign.")
+    monkeypatch.setenv("cage_issuance_max_uses", "2")
+    with pytest.raises(BrokerError, match="did not reveal its attestation pubkey"):
+        with spawn_broker(_BROKER_BIN, signing_key="sk-sign"):
+            pass
+    err = capfd.readouterr().err
+    assert '"cage_issuance_max_uses"' in err and "case-sensitive" in err
+
+
+@_needs_broker
+def test_policy_waiver_is_recorded_on_the_audit_chain(monkeypatch):
+    # The chain shows that a broker ran without a ceiling by request.
+    with spawn_broker(_BROKER_BIN, signing_key="sk-sign", allow_no_policy=True) as bp:
+        events = _audit_events(bp)
+    assert "issuance_policy_waived" in events
+    assert "issuance_policy_frozen" not in events
+    monkeypatch.setenv("CAGE_ISSUANCE_SCOPES", "sign.")
+    with spawn_broker(_BROKER_BIN, signing_key="sk-sign") as bp:
+        events = _audit_events(bp)
+    assert "issuance_policy_frozen" in events
+    assert "issuance_policy_waived" not in events

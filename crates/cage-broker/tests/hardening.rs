@@ -48,12 +48,12 @@ fn broker_command(name: &str) -> (Command, TempDir) {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cage-broker"));
     cmd.arg(dir.join("broker.sock"))
+        .env_clear()
         .env("CAGE_BROKER_SECRET_FILE", &secret_file)
         .env(
             "CAGE_OPERATOR_PUBKEY",
             OperatorKey::generate().public_key_hex(),
         )
-        .env_remove("CAGE_BROKER_ALLOW_DEBUGGER")
         .env("CAGE_BROKER_ALLOW_NO_POLICY", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

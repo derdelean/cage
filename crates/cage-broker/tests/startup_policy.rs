@@ -26,7 +26,9 @@ fn socket(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("cage-policy-{}-{name}.sock", std::process::id()))
 }
 
-/// The broker with an operator key and only `vars` in its environment.
+/// The broker with an operator key and only `vars` in its environment. The
+/// debugger waiver keeps these tests about the policy: the attach hardening runs
+/// first and fails where it is unsupported or the test runs under a tracer.
 fn broker(socket: &PathBuf, vars: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cage-broker"));
     cmd.env_clear()
@@ -34,6 +36,7 @@ fn broker(socket: &PathBuf, vars: &[(&str, &str)]) -> Command {
             "CAGE_OPERATOR_PUBKEY",
             OperatorKey::generate().public_key_hex(),
         )
+        .env("CAGE_BROKER_ALLOW_DEBUGGER", "1")
         .envs(vars.iter().copied())
         .arg(socket)
         .stdin(Stdio::null())
@@ -111,7 +114,7 @@ fn an_unknown_policy_variable_is_refused() {
         ("CAGE_ISSUANCE_SCOPES", "sign."),
         ("CAGE_ISSUANCE_MAX_USE", "2"),
     ]);
-    assert!(stderr.contains("CAGE_ISSUANCE_MAX_USE"), "{stderr}");
+    assert!(stderr.contains("\"CAGE_ISSUANCE_MAX_USE\""), "{stderr}");
 }
 
 #[test]
