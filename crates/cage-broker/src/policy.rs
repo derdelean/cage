@@ -12,7 +12,10 @@
 //! Any other variable whose name starts with `CAGE_ISSUANCE_`, in any case, is an
 //! error as well. Read alone, a misspelled name would be ignored: no policy for the
 //! scope list, the default for a limit, no cap for the cap. A misspelling outside
-//! that prefix is not caught.
+//! that prefix is not caught here. For the scope list the broker catches it anyway,
+//! because it refuses to start without a policy unless the operator sets
+//! `CAGE_BROKER_ALLOW_NO_POLICY=1`. A limit misspelled outside the prefix still takes
+//! its default.
 
 use std::env::VarError;
 
@@ -20,11 +23,11 @@ use cage_core::IssuancePolicy;
 
 const PREFIX: &str = "CAGE_ISSUANCE_";
 const SCOPES_KEY: &str = "CAGE_ISSUANCE_SCOPES";
-const NUMBER_KEYS: [&str; 3] = [
-    "CAGE_ISSUANCE_MAX_TTL",
-    "CAGE_ISSUANCE_MAX_USES",
-    "CAGE_ISSUANCE_MAX_TOKENS_PER_SCOPE",
-];
+const MAX_TTL_KEY: &str = "CAGE_ISSUANCE_MAX_TTL";
+const MAX_USES_KEY: &str = "CAGE_ISSUANCE_MAX_USES";
+const MAX_TOKENS_KEY: &str = "CAGE_ISSUANCE_MAX_TOKENS_PER_SCOPE";
+const NUMBER_KEYS: [&str; 3] = [MAX_TTL_KEY, MAX_USES_KEY, MAX_TOKENS_KEY];
+const KNOWN_KEYS: [&str; 4] = [SCOPES_KEY, MAX_TTL_KEY, MAX_USES_KEY, MAX_TOKENS_KEY];
 
 /// The issuance policy the environment provisions, `Ok(None)` when
 /// `CAGE_ISSUANCE_SCOPES` is unset, or an error naming the malformed or unknown
@@ -45,7 +48,7 @@ fn parse_issuance_policy(
         for key in NUMBER_KEYS {
             if read(&var, key)?.is_some() {
                 return Err(format!(
-                    "{key} is set but CAGE_ISSUANCE_SCOPES is not, so no policy would apply"
+                    "{key} is set but {SCOPES_KEY} is not, so no policy would apply"
                 ));
             }
         }
@@ -57,9 +60,9 @@ fn parse_issuance_policy(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    let max_ttl_seconds = number(&var, "CAGE_ISSUANCE_MAX_TTL")?.unwrap_or(300);
-    let max_uses = number(&var, "CAGE_ISSUANCE_MAX_USES")?.unwrap_or(50);
-    let max_tokens_per_scope = number(&var, "CAGE_ISSUANCE_MAX_TOKENS_PER_SCOPE")?;
+    let max_ttl_seconds = number(&var, MAX_TTL_KEY)?.unwrap_or(300);
+    let max_uses = number(&var, MAX_USES_KEY)?.unwrap_or(50);
+    let max_tokens_per_scope = number(&var, MAX_TOKENS_KEY)?;
     Ok(Some(IssuancePolicy {
         allowed_scopes,
         max_ttl_seconds,
@@ -68,17 +71,27 @@ fn parse_issuance_policy(
     }))
 }
 
-/// An error naming the first variable that carries the policy prefix but is not a
-/// policy variable.
+/// An error naming the first variable that carries the policy prefix, in any case,
+/// but is not a policy variable. The name is printed escaped, so a control
+/// character in it cannot forge a log line.
 fn reject_unknown_names(names: &[String]) -> Result<(), String> {
     for name in names {
-        let known = name == SCOPES_KEY || NUMBER_KEYS.contains(&name.as_str());
-        if !known && name.to_ascii_uppercase().starts_with(PREFIX) {
+        let has_prefix = name
+            .get(..PREFIX.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(PREFIX));
+        if !has_prefix || KNOWN_KEYS.contains(&name.as_str()) {
+            continue;
+        }
+        if let Some(meant) = KNOWN_KEYS.iter().find(|key| key.eq_ignore_ascii_case(name)) {
             return Err(format!(
-                "{name} is not an issuance policy variable (known: {SCOPES_KEY}, {})",
-                NUMBER_KEYS.join(", ")
+                "{name:?} is not an issuance policy variable. Names are case-sensitive, \
+                 did you mean {meant}?"
             ));
         }
+        return Err(format!(
+            "{name:?} is not an issuance policy variable (known: {})",
+            KNOWN_KEYS.join(", ")
+        ));
     }
     Ok(())
 }
@@ -223,6 +236,36 @@ mod tests {
             let err = parse(vars).unwrap_err();
             assert!(err.contains(unknown), "{vars:?}: {err}");
         }
+    }
+
+    #[test]
+    fn the_prefix_ends_at_its_underscore() {
+        let policy = parse(&[
+            ("CAGE_ISSUANCE_SCOPES", "sign."),
+            ("CAGE_ISSUANCE", "x"),
+            ("CAGE_ISSUANCEX", "x"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(policy.allowed_scopes, ["sign."]);
+        let err = parse(&[("CAGE_ISSUANCE_SCOPES", "sign."), ("CAGE_ISSUANCE_", "x")]).unwrap_err();
+        assert!(err.contains("\"CAGE_ISSUANCE_\""), "{err}");
+    }
+
+    #[test]
+    fn a_case_variant_points_to_the_known_name() {
+        let err = parse(&[("Cage_Issuance_Max_Uses", "2")]).unwrap_err();
+        assert!(
+            err.contains("case-sensitive") && err.contains("CAGE_ISSUANCE_MAX_USES"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_escaped_in_the_error() {
+        // A newline in the name would otherwise start a forged log line.
+        let err = parse(&[("CAGE_ISSUANCE_X\n[cage-broker] policy frozen", "1")]).unwrap_err();
+        assert!(!err.contains('\n'), "{err}");
     }
 
     #[test]

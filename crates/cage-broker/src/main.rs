@@ -40,8 +40,8 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_SOCKET.to_string());
 
-    // Optional frozen issuance ceiling (`issuance_policy_from_env` lists the
-    // variables). Provisioned here and never again: the gate has no setter, so a
+    // The frozen issuance ceiling, required unless waived below
+    // (`issuance_policy_from_env` lists the variables). Provisioned here and never again: the gate has no setter, so a
     // caller who later reaches the control plane — including one holding a stolen
     // operator key — cannot widen it. Relaxing it means restarting this process with
     // different provisioning, so it does not bind whoever can restart the process.
@@ -63,7 +63,24 @@ fn main() {
             );
             gate
         }
-        None => Gate::new(),
+        // No policy only on request. Otherwise an unset or misspelled
+        // CAGE_ISSUANCE_SCOPES would leave the issuer bounded by the hard ceilings
+        // alone, without a word. Only the value 1 waives.
+        None if std::env::var("CAGE_BROKER_ALLOW_NO_POLICY").as_deref() == Ok("1") => {
+            eprintln!(
+                "[cage-broker] WARNING: CAGE_BROKER_ALLOW_NO_POLICY=1. No issuance policy, \
+                 so a stolen operator key can mint tokens for any scope, in any number, up \
+                 to the hard TTL and use ceilings. Not for production."
+            );
+            Gate::new()
+        }
+        None => {
+            eprintln!(
+                "[cage-broker] FATAL: no issuance policy. Set CAGE_ISSUANCE_SCOPES (for \
+                 example llm.,sign.), or CAGE_BROKER_ALLOW_NO_POLICY=1 to run without one."
+            );
+            std::process::exit(1);
+        }
     };
 
     // Record the waiver on the chain, as the core records its own dev switches, so a

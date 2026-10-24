@@ -323,10 +323,11 @@ def _issue_and_invoke(bp, provider):
 
 
 @_needs_broker
-def test_provider_key_registers_llm_scope():
+def test_provider_key_registers_llm_scope(monkeypatch):
     # With a provider key supplied, an llm-scoped token resolves to it and reaches
     # provider validation: an UNKNOWN provider is rejected there (network-free),
     # proving scope->secret resolution + the invoke verb — not a missing secret.
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
     with spawn_broker(_BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake") as bp:
         with pytest.raises(BrokerError, match="unknown provider"):
             _issue_and_invoke(bp, "no-such-provider")
@@ -337,8 +338,9 @@ def _audit_events(bp) -> list[str]:
 
 
 @_needs_broker
-def test_debugger_waiver_is_recorded_on_the_audit_chain():
+def test_debugger_waiver_is_recorded_on_the_audit_chain(monkeypatch):
     # A chain without the entry came from a broker that denied debugger attach.
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
     with spawn_broker(_BROKER_BIN, signing_key="sk-sign") as bp:
         assert "debugger_attach_allowed" not in _audit_events(bp)
     with spawn_broker(_BROKER_BIN, signing_key="sk-sign", allow_debugger=True) as bp:
@@ -350,15 +352,30 @@ def test_llm_provider_pin_refuses_another_provider(monkeypatch):
     # CAGE_LLM_PROVIDER pins the broker's LLM key: a token cannot send it to another
     # provider's host. Refused before any network call.
     monkeypatch.setenv("CAGE_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
     with spawn_broker(_BROKER_BIN, signing_key="sk-sign", llm_api_key="sk-fake") as bp:
         with pytest.raises(CageViolation, match="pinned to provider"):
             _issue_and_invoke(bp, "openai")
 
 
 @_needs_broker
-def test_sign_only_broker_does_not_register_llm_scope():
+def test_sign_only_broker_does_not_register_llm_scope(monkeypatch):
     # Without a provider key the llm. scope is never registered, so an llm-scoped
     # token does not resolve — refused before any network.
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
     with spawn_broker(_BROKER_BIN, signing_key="sk-sign") as bp:
         with pytest.raises(CageViolation, match="unknown scope namespace"):
             _issue_and_invoke(bp, "anthropic")
+
+
+@_needs_broker
+def test_broker_without_a_policy_refuses_to_start(monkeypatch, capfd):
+    # spawn_broker forwards only CAGE_* names, so the lowercase one never reaches the
+    # broker. The broker sees no policy and refuses, as for any misspelled scope list.
+    monkeypatch.delenv("CAGE_BROKER_ALLOW_NO_POLICY", raising=False)
+    monkeypatch.delenv("CAGE_ISSUANCE_SCOPES", raising=False)
+    monkeypatch.setenv("cage_issuance_scopes", "sign.")
+    with pytest.raises(BrokerError, match="did not reveal its attestation pubkey"):
+        with spawn_broker(_BROKER_BIN, signing_key="sk-sign"):
+            pass
+    assert "FATAL: no issuance policy" in capfd.readouterr().err

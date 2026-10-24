@@ -337,12 +337,13 @@ class TestRealBroker:
     SECRET = "sk-LIVE-broker-client-test-7e3a1f9c-not-a-real-key"
 
     @pytest.fixture
-    def broker(self):
+    def broker(self, monkeypatch):
         """Start a real cage-broker via the launcher (which generates the operator
         key, provisions its public half, and pre-wires a signing client) and yield
-        the BrokerProcess."""
+        the BrokerProcess. It runs without an issuance policy, so it waives one."""
         from cage.broker import spawn_broker
 
+        monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
         with spawn_broker(_find_broker_bin(), signing_key=self.SECRET) as bp:
             yield bp
 

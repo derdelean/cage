@@ -113,13 +113,14 @@ _BROKER_BIN = os.environ.get("CAGE_BROKER_BIN")
     not _BROKER_BIN,
     reason="set CAGE_BROKER_BIN=path/to/cage-broker to run the real-broker test",
 )
-def test_real_broker_refuses_out_of_scope_through_adapter():
+def test_real_broker_refuses_out_of_scope_through_adapter(monkeypatch):
     # End-to-end over a real Unix socket: a sign-scoped token driving an LLM invoke
     # must be refused at the broker's authority layer (verb-bound), proving the
     # adapter -> BrokerClient -> socket -> broker -> gate path and structural refusal
     # (and that the broker invoke op parses — guarding the RawValue->Value fix).
     from cage.broker import spawn_broker
 
+    monkeypatch.setenv("CAGE_BROKER_ALLOW_NO_POLICY", "1")
     with spawn_broker(_BROKER_BIN, signing_key="sk-test-not-a-real-key") as bp:
         token = bp.client.issue_token(
             scope="sign.invoice", context="adapter-it",

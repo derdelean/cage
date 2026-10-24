@@ -652,6 +652,10 @@ def spawn_broker(
     attestation ``pubkey`` on startup, both captured on the returned object once
     entered. ``allow_debugger=True`` starts the broker without its debugger-attach
     hardening (dev only, see :class:`BrokerProcess`).
+
+    The broker gets the caller's ``CAGE_*`` settings and refuses to start without an
+    issuance policy, so set ``CAGE_ISSUANCE_SCOPES`` (for example ``llm.,sign.``), or
+    ``CAGE_BROKER_ALLOW_NO_POLICY=1`` to run without one.
     """
     return BrokerProcess(
         broker_bin,
