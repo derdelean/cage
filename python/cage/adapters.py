@@ -10,6 +10,7 @@ one and pass a scoped token; the call sites stay the same.
     from cage.broker import spawn_broker
     from cage.adapters import CagedAnthropic
 
+    os.environ["CAGE_ISSUANCE_SCOPES"] = "llm."    # the broker's issuance ceiling
     with spawn_broker(broker_bin, signing_key=key) as bp:
         token = bp.client.issue_token(
             scope="llm.evaluate", ttl_seconds=60, max_uses=3,

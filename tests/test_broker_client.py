@@ -340,10 +340,12 @@ class TestRealBroker:
     def broker(self):
         """Start a real cage-broker via the launcher (which generates the operator
         key, provisions its public half, and pre-wires a signing client) and yield
-        the BrokerProcess."""
+        the BrokerProcess. It runs without an issuance policy, so it waives one."""
         from cage.broker import spawn_broker
 
-        with spawn_broker(_find_broker_bin(), signing_key=self.SECRET) as bp:
+        with spawn_broker(
+            _find_broker_bin(), signing_key=self.SECRET, allow_no_policy=True,
+        ) as bp:
             yield bp
 
     def test_issue_sign_overuse_revoke_audit(self, broker):

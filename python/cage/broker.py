@@ -379,6 +379,7 @@ class BrokerProcess:
     is not the agent (see DEPLOY.md) and hold the operator key in a custody-backed
     signer.
 
+        os.environ["CAGE_ISSUANCE_SCOPES"] = "llm."  # the issuance ceiling
         with spawn_broker("target/release/cage-broker", signing_key=key) as bp:
             token = bp.client.issue_token(
                 scope="llm.evaluate", ttl_seconds=60, max_uses=3,
@@ -399,6 +400,7 @@ class BrokerProcess:
         socket_path: str | None = None,
         timeout: float = 10.0,
         allow_debugger: bool = False,
+        allow_no_policy: bool = False,
     ) -> None:
         """:param broker_bin: path to the built ``cage-broker`` binary.
         :param signing_key: the credential the broker signs / decrypts with.
@@ -412,14 +414,24 @@ class BrokerProcess:
             (``CAGE_BROKER_ALLOW_DEBUGGER=1``), for debugging or a memory-residency
             scan. Dev only: a same-user process can then read the key. The variable
             is never forwarded from the caller's environment.
+        :param allow_no_policy: start the broker without an issuance policy
+            (``CAGE_BROKER_ALLOW_NO_POLICY=1``). A stolen operator key can then mint
+            any scope up to the hard ceilings. Like the debugger waiver, the variable
+            is never forwarded from the caller's environment, so a waiver left in a
+            shell profile cannot hide a missing or misspelled policy.
         """
-        if not isinstance(allow_debugger, bool):
-            raise CageViolation(
-                f"allow_debugger must be a bool, got {type(allow_debugger).__name__}. "
-                'Refusing to coerce: a truthy string such as "false" would otherwise '
-                "switch off the broker's hardening."
-            )
+        for name, value in (
+            ("allow_debugger", allow_debugger),
+            ("allow_no_policy", allow_no_policy),
+        ):
+            if not isinstance(value, bool):
+                raise CageViolation(
+                    f"{name} must be a bool, got {type(value).__name__}. "
+                    'Refusing to coerce: a truthy string such as "false" would '
+                    "otherwise switch off a broker safeguard."
+                )
         self.allow_debugger = allow_debugger
+        self.allow_no_policy = allow_no_policy
         self.broker_bin = broker_bin
         # Held only until _start hands them to the broker.
         self._signing_key: str | None = signing_key
@@ -537,12 +549,15 @@ class BrokerProcess:
     def _broker_env(self, cred: str, operator_pubkey: str) -> dict[str, str]:
         # The broker reads only CAGE_* settings, so it gets only those. Everything
         # else in the caller's environment, a provider key or LD_PRELOAD included,
-        # stays out of the broker's environment block. The debugger waiver never
-        # rides in on the caller's environment either: it takes allow_debugger=True.
+        # stays out of the broker's environment block. The prefix is matched in any
+        # case, so a miscased policy name reaches the broker, which refuses it. The
+        # waivers never ride in on the caller's environment: they take
+        # allow_debugger=True and allow_no_policy=True.
+        waivers = {"CAGE_BROKER_ALLOW_DEBUGGER", "CAGE_BROKER_ALLOW_NO_POLICY"}
         env = {
             name: value
             for name, value in os.environ.items()
-            if name.startswith("CAGE_") and name != "CAGE_BROKER_ALLOW_DEBUGGER"
+            if name.upper().startswith("CAGE_") and name.upper() not in waivers
         }
         env["CAGE_BROKER_SECRET_FILE"] = cred
         # CAGE_OPERATOR_PUBKEY is PUBLIC (integrity, not secrecy), so an env var is
@@ -550,6 +565,8 @@ class BrokerProcess:
         env["CAGE_OPERATOR_PUBKEY"] = operator_pubkey
         if self.allow_debugger:
             env["CAGE_BROKER_ALLOW_DEBUGGER"] = "1"
+        if self.allow_no_policy:
+            env["CAGE_BROKER_ALLOW_NO_POLICY"] = "1"
         return env
 
     def terminate(self) -> None:
@@ -641,6 +658,7 @@ def spawn_broker(
     socket_path: str | None = None,
     timeout: float = 10.0,
     allow_debugger: bool = False,
+    allow_no_policy: bool = False,
 ) -> BrokerProcess:
     """Create a :class:`BrokerProcess` for ``broker_bin`` — use it as a context manager.
 
@@ -652,6 +670,10 @@ def spawn_broker(
     attestation ``pubkey`` on startup, both captured on the returned object once
     entered. ``allow_debugger=True`` starts the broker without its debugger-attach
     hardening (dev only, see :class:`BrokerProcess`).
+
+    The broker gets the caller's ``CAGE_*`` settings and refuses to start without an
+    issuance policy, so set ``CAGE_ISSUANCE_SCOPES`` (for example ``llm.,sign.``), or
+    pass ``allow_no_policy=True`` to run without one (dev and tests).
     """
     return BrokerProcess(
         broker_bin,
@@ -660,4 +682,5 @@ def spawn_broker(
         socket_path=socket_path,
         timeout=timeout,
         allow_debugger=allow_debugger,
+        allow_no_policy=allow_no_policy,
     )

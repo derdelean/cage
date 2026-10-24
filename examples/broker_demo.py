@@ -247,6 +247,9 @@ def main() -> int:
         raise SystemExit(f"broker binary not found: {broker_bin} (run: cargo build -p cage-broker)")
     # spawn_broker never forwards the waiver from the environment, so pass it on.
     allow_debugger = os.environ.get("CAGE_BROKER_ALLOW_DEBUGGER") == "1"
+    # The issuance ceiling the operator provisions. spawn_broker hands the broker
+    # the caller's CAGE_* settings, so a policy already in the environment wins.
+    os.environ.setdefault("CAGE_ISSUANCE_SCOPES", "sign.")
     with spawn_broker(broker_bin, signing_key=SECRET, allow_debugger=allow_debugger) as bp:
         proc, sock, pubkey, broker = (
             bp.proc, bp.socket_path, bp.pubkey, bp.client,

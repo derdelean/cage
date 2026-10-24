@@ -139,6 +139,13 @@ The broker control plane (mint / revoke / attest / audit-log) is authenticated b
 - The operator's **private** key is the control-plane root authority. The launcher (`spawn_broker`) generates one in-process and pre-wires the client to sign with it. In production, hold it in the operator process, ideally in an OS keystore or an HSM. The broker prints nothing secret on stdout, only its public attestation key.
 - Protecting the authority root against a compromised host requires the operator key to live in a **separate trust domain** from the broker, such as an HSM or a hardware token. The signer is pluggable, so such a custody backend fits in without a wire-protocol change.
 
+### Issuance policy
+
+The broker refuses to start without an issuance policy. Set `CAGE_ISSUANCE_SCOPES` to the scope namespaces the operator may mint, for example `llm.,sign.`, and optionally `CAGE_ISSUANCE_MAX_TTL`, `CAGE_ISSUANCE_MAX_USES` and `CAGE_ISSUANCE_MAX_TOKENS_PER_SCOPE`. The policy is frozen at start, so a stolen operator key can mint only what it allows. A malformed value, a scope list that names no scope, a limit set without `CAGE_ISSUANCE_SCOPES`, or an unknown name starting with `CAGE_ISSUANCE_` in any case stops the broker at start. A scope list misspelled outside that prefix leaves the broker without a policy, so it refuses to start as well. A limit misspelled outside the prefix is not caught and takes its default.
+
+- To run without a policy, set `CAGE_BROKER_ALLOW_NO_POLICY=1`, or pass `allow_no_policy=True` to `spawn_broker`, which never takes the waiver from the caller's environment. Only the value `1` waives. The broker then prints a warning and records `issuance_policy_waived` on its audit chain, and a stolen operator key can mint tokens for any scope, in any number, up to the hard ceilings of 7 days and 100,000 uses per token.
+- `spawn_broker` hands the broker the caller's settings whose names start with `CAGE_` in any case, so a policy name written in another case, such as `cage_issuance_max_uses`, reaches the broker and is refused.
+
 ### Keeping the agent out of the broker's memory
 
 The broker protects the key only if the agent cannot read the broker's memory. In the default layout the agent and the broker run under the same user, and most systems let a user debug their own processes.

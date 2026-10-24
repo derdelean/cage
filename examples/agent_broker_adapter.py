@@ -50,7 +50,9 @@ def main() -> int:
     # The provider key is handed to the broker through a sealed file and lives only
     # inside it. This process holds the operator signing key (control-plane root);
     # the agent is handed only a token. bp.client is pre-wired to sign control-plane
-    # requests with that operator key.
+    # requests with that operator key. The broker also needs an issuance ceiling,
+    # which it reads from the CAGE_* settings spawn_broker hands it.
+    os.environ.setdefault("CAGE_ISSUANCE_SCOPES", "llm.,sign.")
     with spawn_broker(broker_bin, signing_key="sk-broker-signing-key", llm_api_key=llm_key) as bp:
         print(f"cage-broker up (pid {bp.proc.pid}). The provider key is inside it; no RPC returns it.")
 

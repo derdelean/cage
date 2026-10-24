@@ -40,8 +40,8 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_SOCKET.to_string());
 
-    // Optional frozen issuance ceiling (`issuance_policy_from_env` lists the
-    // variables). Provisioned here and never again: the gate has no setter, so a
+    // The frozen issuance ceiling, required unless waived below
+    // (`issuance_policy_from_env` lists the variables). Provisioned here and never again: the gate has no setter, so a
     // caller who later reaches the control plane — including one holding a stolen
     // operator key — cannot widen it. Relaxing it means restarting this process with
     // different provisioning, so it does not bind whoever can restart the process.
@@ -49,6 +49,7 @@ fn main() {
         eprintln!("[cage-broker] FATAL: issuance policy: {e}");
         std::process::exit(1);
     });
+    let policy_waived = policy.is_none();
     let mut gate = match policy {
         Some(policy) => {
             let scopes = policy.allowed_scopes.len();
@@ -63,26 +64,36 @@ fn main() {
             );
             gate
         }
-        None => Gate::new(),
+        // No policy only on request. Otherwise an unset or misspelled
+        // CAGE_ISSUANCE_SCOPES would leave the issuer bounded by the hard ceilings
+        // alone, without a word. Only the value 1 waives.
+        None if std::env::var("CAGE_BROKER_ALLOW_NO_POLICY").as_deref() == Ok("1") => {
+            eprintln!(
+                "[cage-broker] WARNING: CAGE_BROKER_ALLOW_NO_POLICY=1. No issuance policy, \
+                 so a stolen operator key can mint tokens for any scope, in any number, up \
+                 to the hard TTL and use ceilings. Not for production."
+            );
+            Gate::new()
+        }
+        None => {
+            eprintln!(
+                "[cage-broker] FATAL: no issuance policy. Set CAGE_ISSUANCE_SCOPES (for \
+                 example llm.,sign.), or CAGE_BROKER_ALLOW_NO_POLICY=1 to run without one."
+            );
+            std::process::exit(1);
+        }
     };
 
     // Record the waiver on the chain, as the core records its own dev switches, so a
     // chain without this entry came from a broker that denied debugger attach. A
     // waived broker's memory is readable, so this holds only up to the first anchor.
     if allow_debugger {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        gate.append_audit(
-            "broker".to_string(),
-            "debugger_attach_allowed".to_string(),
-            "{}".to_string(),
-            now.to_string(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("[cage-broker] FATAL: cannot record the debugger waiver: {e}");
-            std::process::exit(1);
-        });
+        record_waiver(&mut gate, "debugger_attach_allowed");
+    }
+    // Likewise for the policy waiver: the chain itself then shows that this broker
+    // ran without an issuance ceiling by request.
+    if policy_waived {
+        record_waiver(&mut gate, "issuance_policy_waived");
     }
 
     // Load the signing credential from a SEALED SOURCE, never from an environment
@@ -188,4 +199,22 @@ fn main() {
         eprintln!("[cage-broker] fatal: {e}");
         std::process::exit(1);
     }
+}
+
+/// Append a start-up waiver to the audit chain, or stop the broker: a waived broker
+/// whose chain does not say so would pass for one without the waiver.
+fn record_waiver(gate: &mut Gate, event: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    gate.append_audit(
+        "broker".to_string(),
+        event.to_string(),
+        "{}".to_string(),
+        now.to_string(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("[cage-broker] FATAL: cannot record {event} on the audit chain: {e}");
+        std::process::exit(1);
+    });
 }
