@@ -280,7 +280,7 @@ class BrokerClient:
         except (KeyError, TypeError, json.JSONDecodeError) as e:
             raise BrokerError(f"broker returned no parseable provider response: {e}") from e
 
-    # -- audit (head / verify are open; log / attest are bootstrap-gated) ---
+    # -- audit (head / verify are open, log / attest need the operator signature) --
 
     def audit_head(self) -> str:
         """Current audit-chain head hash (unauthenticated; carries no token_ids)."""
@@ -361,8 +361,8 @@ class BrokerClient:
 #
 # Adopting the secure out-of-process deployment shouldn't mean hand-rolling the
 # spawn ceremony. BrokerProcess captures it once: spawn the broker, read the
-# bootstrap token and attestation pubkey it reveals on stdout, hand it its
-# credential through a sealed file, and tear it all down on exit.
+# attestation pubkey it prints on stdout, hand it its credential through a sealed
+# file, and tear it all down on exit.
 
 
 class BrokerProcess:
@@ -666,9 +666,9 @@ def spawn_broker(
     through a transient ``0600`` file (never an env var) and deleted once loaded.
     Supplying ``llm_api_key`` lets the broker serve token-gated LLM calls on the
     ``llm.`` scope. With ``socket_path`` omitted, a private temp socket is created
-    and removed on exit. The broker reveals a one-time ``bootstrap`` token and an
-    attestation ``pubkey`` on startup, both captured on the returned object once
-    entered. ``allow_debugger=True`` starts the broker without its debugger-attach
+    and removed on exit. The broker prints its attestation ``pubkey`` on startup,
+    captured on the returned object once entered. It prints no secret: the control
+    plane checks signatures from the operator key the launcher generates. ``allow_debugger=True`` starts the broker without its debugger-attach
     hardening (dev only, see :class:`BrokerProcess`).
 
     The broker gets the caller's ``CAGE_*`` settings and refuses to start without an

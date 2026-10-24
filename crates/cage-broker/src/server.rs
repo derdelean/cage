@@ -161,7 +161,8 @@ fn handle_conn<S: Read + Write>(mut stream: S, gate: &Arc<Mutex<Gate>>) {
 
 /// Run an Invoke without holding the Gate lock across the network: reserve the use
 /// and decrypt the key under the lock (microseconds), release the lock, hand the key
-/// to the transport (which zeroes it once the request is assembled), perform the TLS
+/// to the transport (which zeroes its copy once the request buffer holds it, and
+/// that buffer once the request is written), perform the TLS
 /// round-trip, then re-acquire only to settle (record / refund). Authorize and
 /// charge stay atomic (no use-count race) while a slow upstream blocks no one else.
 fn serve_invoke(gate: &Arc<Mutex<Gate>>, token_id: &str, provider: &str, body: &str) -> Response {

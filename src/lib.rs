@@ -222,8 +222,9 @@ impl RustGate {
     /// lock, releases the lock, performs the TLS round-trip with the GIL released,
     /// then settles (success records; a pre-send failure refunds the use; a
     /// post-send failure keeps it charged). The decrypted key stays in Rust-owned
-    /// memory (the reservation, then the transport, which zeroes it once the request
-    /// is assembled) and never becomes a Python object.
+    /// memory (the reservation, then the transport, which zeroes its copy once the
+    /// request buffer holds it, and that buffer once the request is written) and
+    /// never becomes a Python object.
     pub fn invoke(
         &self,
         py: Python<'_>,
