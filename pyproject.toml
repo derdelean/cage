@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cage-ai"
-version = "0.1.1"
+version = "0.1.2"
 description = "CAGE: credential containment for AI agents. Capability-token-gated, structurally refusing, audit-chained."
 readme = "README.md"
 license = { file = "LICENSE" }

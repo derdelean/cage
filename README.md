@@ -148,8 +148,8 @@ A bare `import cage` (the authority core) needs no native extension. The vault a
 To use CAGE from another local project, build a wheel and install it:
 
 ```bash
-maturin build --release                      # -> target/wheels/cage_ai-0.1.1-*.whl
-pip install target/wheels/cage_ai-0.1.1-*.whl
+maturin build --release                      # -> target/wheels/cage_ai-0.1.2-*.whl
+pip install target/wheels/cage_ai-0.1.2-*.whl
 ```
 
 or reference the checkout as a path dependency:
