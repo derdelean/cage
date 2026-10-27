@@ -9,6 +9,8 @@ description = "CAGE (Credential-bound Agent Gating Engine): capability tokens, s
 readme = "README.md"
 keywords = ["security", "cryptography", "ai-agents", "capability-tokens"]
 categories = ["cryptography", "authentication", "api-bindings"]
+# Ships inside the cage-ai wheel on PyPI, never to crates.io.
+publish = false
 
 [workspace]
 members = [
