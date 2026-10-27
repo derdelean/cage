@@ -112,7 +112,7 @@ These are the gaps as of v0.1. Reports and fixes are welcome (see [SECURITY.md](
 
 ## Verifying signed releases
 
-Every CAGE wheel published on GitHub Releases is signed with [Sigstore](https://sigstore.dev/) through GitHub Actions OIDC and Fulcio. The signing is keyless: no long-lived signing key exists in the repo or in CI. Every signature is recorded in the public [Rekor](https://docs.sigstore.dev/rekor/overview/) transparency log.
+Every CAGE wheel published on GitHub Releases is signed with [Sigstore](https://sigstore.dev/) through GitHub Actions OIDC and Fulcio. The signing is keyless: no long-lived signing key exists in the repo or in CI. Every signature is recorded in the public [Rekor](https://docs.sigstore.dev/rekor/overview/) transparency log. Releases after v0.1.2 also carry a signed sdist and a signed CycloneDX SBOM (`cage_ai-X.Y.Z.cdx.json`) that lists the Rust crates compiled into the wheels.
 
 To verify a downloaded wheel before installing:
 
@@ -120,13 +120,13 @@ To verify a downloaded wheel before installing:
 cosign verify-blob \
   --certificate cage_ai-X.Y.Z-*.whl.cert \
   --signature   cage_ai-X.Y.Z-*.whl.sig \
-  --certificate-identity-regexp \
-    "https://github.com/derdelean/cage/\.github/workflows/release\.yml@.*" \
+  --certificate-identity \
+    "https://github.com/derdelean/cage/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   cage_ai-X.Y.Z-*.whl
 ```
 
-A passing verification proves the wheel was built by this repository's release workflow at the tagged commit, and the proof is publicly recorded in Rekor. The same workflow publishes to PyPI through trusted publishing (no API token), and PyPI shows a Sigstore attestation for each file. CAGE proposes credential containment through capability tokens and an audit chain, and its own releases are signed with the same Sigstore, Fulcio and Rekor model.
+A passing verification proves the wheel was built by this repository's release workflow at the tag `vX.Y.Z`, and the proof is publicly recorded in Rekor. The same workflow publishes to PyPI through trusted publishing (no API token), and PyPI shows a Sigstore attestation for each file. CAGE proposes credential containment through capability tokens and an audit chain, and its own releases are signed with the same Sigstore, Fulcio and Rekor model.
 
 ## Installing
 

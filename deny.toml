@@ -1,0 +1,41 @@
+# cargo-deny rules for every crate in Cargo.lock, checked in CI by the
+# `cargo-deny` job in .github/workflows/build.yml. Run it locally with
+# `cargo deny --locked check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Any RustSec advisory fails the check, including unmaintained and unsound
+# crates. An entry in `ignore` needs the advisory ID and a reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every license in the tree is permissive and compatible with Apache-2.0.
+# Adding one to this list is a decision, not a fix for a red build.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+# Crates come from crates.io and nowhere else: no other registry, no git
+# dependency.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

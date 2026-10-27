@@ -7,8 +7,9 @@
 # `stable` on both sides is not enough: two machines resolve `stable` to whatever they
 # last downloaded. An exact version is the only thing that makes local and CI agree.
 #
-# Bump deliberately, and bump BOTH places: this file and the `toolchain:` input in
-# .github/workflows/build.yml. Run `cargo clippy --workspace --all-targets -- -D warnings`
+# Bump deliberately, here and nowhere else. CI runs `rustup toolchain install`,
+# which reads this file, and maturin-action reads it for the Linux release
+# wheels. Run `cargo clippy --workspace --all-targets -- -D warnings`
 # after bumping — a newer toolchain means new lints, which is the point.
 [toolchain]
 channel = "1.97.0"

@@ -3,12 +3,14 @@ name: release
 # Sigstore-signed release pipeline.
 #
 # When a tag v* is pushed:
-#   1. Build manylinux + macOS wheels via maturin (Python 3.11–3.14) and an sdist
-#   2. Sign every wheel via cosign with GitHub Actions OIDC + Fulcio
+#   1. Build manylinux + macOS wheels via maturin (Python 3.11–3.14), an sdist,
+#      and a CycloneDX SBOM of the Rust crates compiled into the wheels
+#   2. Sign every file via cosign with GitHub Actions OIDC + Fulcio
 #      (keyless: no long-lived signing key lives in this repo or in CI)
-#   3. Publish a GitHub Release with the wheels alongside their .sig + .cert files
+#   3. Verify every signature against this workflow at this tag, then publish
+#      a GitHub Release with the files alongside their .sig + .cert files
 #   4. Each signature is recorded in the public Sigstore Rekor transparency log.
-#      Verification proves the wheel was built by THIS repository's release.yml
+#      Verification proves the file was built by THIS repository's release.yml
 #      at the tagged commit.
 #   5. Publish the wheels and the sdist to PyPI as cage-ai through trusted
 #      publishing (OIDC, no API token). PyPI attaches a Sigstore attestation.
@@ -22,171 +24,292 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write    # publish GitHub Releases
-  id-token: write    # OIDC token for cosign keyless signing
+# No job holds a permission it does not declare. The jobs that compile code
+# (wheels, sdist, SBOM) only read the repository, because a build script in a
+# compromised crate runs inside them. Each write power sits with the one job
+# that uses it: `sign` requests the OIDC token that Fulcio turns into a signing
+# certificate, and `release` writes the GitHub release.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build-wheels:
     name: build wheel (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-06-15
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          toolchain: stable
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv venv --python ${{ matrix.python-version }}
-
-      - name: Install maturin
-        run: |
-          source .venv/bin/activate
-          uv pip install maturin
+          persist-credentials: false
 
       # Built inside the manylinux_2_28 container: the runner's own glibc is newer
       # than the manylinux_2_28 tag allows, so a native build fails the check.
+      # The action reads the toolchain from rust-toolchain.toml. maturin-version
+      # matches the maturin in uv.lock.
       - name: Build wheel (manylinux on Linux)
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           manylinux: 2_28
-          args: --release --strip -i python${{ matrix.python-version }}
+          maturin-version: v1.13.3
+          args: --release --locked --strip -i python${{ matrix.python-version }}
+
+      - name: Install Rust toolchain
+        if: runner.os == 'macOS'
+        run: rustup toolchain install --no-self-update
+
+      - name: Install uv
+        if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          # A release build never restores a cache that another run wrote.
+          enable-cache: false
+
+      - name: Install maturin (locked)
+        if: runner.os == 'macOS'
+        run: uv sync --locked --only-group build --no-install-project --python "$PYTHON_VERSION"
 
       - name: Build wheel (macOS)
         if: runner.os == 'macOS'
         run: |
           source .venv/bin/activate
-          maturin build --release --strip -i python${{ matrix.python-version }}
+          maturin build --release --locked --strip -i "python$PYTHON_VERSION"
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
           path: target/wheels/*.whl
           if-no-files-found: error
 
-  sign-and-release:
-    name: sign + release
-    needs: build-wheels
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
-          pattern: wheel-*
-          merge-multiple: true
-
-      - name: List downloaded wheels
-        run: ls -la artifacts/
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-        with:
-          cosign-release: v2.4.1
-
-      - name: Sign wheels (keyless, OIDC → Fulcio → Rekor)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
-        run: |
-          set -euo pipefail
-          mkdir -p signed
-          for wheel in artifacts/*.whl; do
-            base=$(basename "$wheel")
-            echo "Signing $base"
-            cosign sign-blob --yes \
-              --output-signature  "signed/${base}.sig" \
-              --output-certificate "signed/${base}.cert" \
-              "$wheel"
-            cp "$wheel" "signed/"
-          done
-          ls -la signed/
-
-      - name: Verify signatures locally (sanity check)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
-        run: |
-          set -euo pipefail
-          for wheel in signed/*.whl; do
-            base=$(basename "$wheel")
-            echo "Verifying $base"
-            cosign verify-blob \
-              --certificate       "signed/${base}.cert" \
-              --signature         "signed/${base}.sig" \
-              --certificate-identity-regexp "https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@.*" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "$wheel"
-          done
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          name: ${{ github.ref_name }}
-          body: |
-            CAGE ${{ github.ref_name }}, Sigstore-signed. Also on PyPI as `cage-ai`.
-
-            Every wheel below is signed with Sigstore (keyless OIDC and Fulcio),
-            and the signature is recorded in the public Rekor transparency log.
-
-            **Verify before installing:**
-
-            ```bash
-            cosign verify-blob \
-              --certificate cage_ai-*.whl.cert \
-              --signature   cage_ai-*.whl.sig \
-              --certificate-identity-regexp \
-                "https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@.*" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              cage_ai-*.whl
-            ```
-
-            A passing verification proves the wheel was built by this
-            repository's release workflow at the tagged commit, and the proof
-            is recorded in Rekor.
-          files: |
-            signed/*.whl
-            signed/*.sig
-            signed/*.cert
-          fail_on_unmatched_files: true
-
   sdist:
     name: build sdist
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
+          maturin-version: v1.13.3
           args: --out dist
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sdist
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CYCLONEDX_VERSION: "0.5.9"
+      # GitHub's digest for cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz
+      CYCLONEDX_SHA256: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Install cargo-cyclonedx (checksum-verified release binary)
+        run: |
+          set -euo pipefail
+          name="cargo-cyclonedx-x86_64-unknown-linux-gnu"
+          curl -sSfL -o "$RUNNER_TEMP/$name.tar.xz" \
+            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CYCLONEDX_VERSION}/$name.tar.xz"
+          echo "${CYCLONEDX_SHA256}  $RUNNER_TEMP/$name.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$name.tar.xz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/$name/cargo-cyclonedx" "$RUNNER_TEMP/cargo-cyclonedx"
+
+      # The root crate is the one compiled into the wheel. Its SBOM lists every
+      # crate in that build, cage-core and its dependencies included.
+      - name: Generate SBOM
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/cargo-cyclonedx" cyclonedx --manifest-path Cargo.toml --format json --spec-version 1.5
+          mkdir -p sbom
+          mv cage.cdx.json "sbom/cage_ai-${GITHUB_REF_NAME#v}.cdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
+  sign:
+    name: sign (keyless, OIDC → Fulcio → Rekor)
+    needs: [build-wheels, sdist, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC token that Fulcio turns into the signing certificate
+
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdist
+          path: artifacts
+
+      - name: Download SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sbom
+          path: artifacts
+
+      - name: List files to sign
+        run: ls -la artifacts/
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign every file (keyless, OIDC → Fulcio → Rekor)
+        run: |
+          set -euo pipefail
+          mkdir -p signed
+          for f in artifacts/*; do
+            base=$(basename "$f")
+            echo "Signing $base"
+            cosign sign-blob --yes \
+              --output-signature  "signed/${base}.sig" \
+              --output-certificate "signed/${base}.cert" \
+              "$f"
+            cp "$f" signed/
+          done
+          ls -la signed/
+
+      - name: Upload signed files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed
+          path: signed/
+          if-no-files-found: error
+
+  release:
+    name: verify + GitHub release
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create and publish the GitHub release
+
+    steps:
+      - name: Download signed files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed
+          path: signed
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+        with:
+          cosign-release: v2.4.1
+
+      # The identity is exact: this repository's release.yml at this tag. A
+      # signature made by the same file on another branch or tag fails here.
+      - name: Verify every signature against this workflow at this tag
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          for f in signed/*; do
+            case "$f" in *.sig|*.cert) continue ;; esac
+            base=$(basename "$f")
+            echo "Verifying $base"
+            cosign verify-blob \
+              --certificate "signed/${base}.cert" \
+              --signature   "signed/${base}.sig" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+          done
+
+      # Created as a draft and published once every file is attached. With
+      # immutable releases on, publishing locks the files and the tag.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
+            echo "refusing to release unexpected tag name: $GITHUB_REF_NAME"
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          CAGE @TAG@, Sigstore-signed. Also on PyPI as `cage-ai`.
+
+          Every file below is signed with Sigstore (keyless OIDC and Fulcio),
+          and the signature is recorded in the public Rekor transparency log.
+          That covers the wheels, the sdist and `cage_ai-@VERSION@.cdx.json`,
+          a CycloneDX SBOM of the Rust crates compiled into the wheels.
+
+          **Verify before installing:**
+
+          ```bash
+          cosign verify-blob \
+            --certificate cage_ai-*.whl.cert \
+            --signature   cage_ai-*.whl.sig \
+            --certificate-identity \
+              "https://github.com/@REPO@/.github/workflows/release.yml@refs/tags/@TAG@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            cage_ai-*.whl
+          ```
+
+          A passing verification proves the file was built by this
+          repository's release workflow at the tag @TAG@, and the proof
+          is recorded in Rekor.
+          EOF
+          sed -i -e "s|@TAG@|${GITHUB_REF_NAME}|g" \
+                 -e "s|@VERSION@|${GITHUB_REF_NAME#v}|g" \
+                 -e "s|@REPO@|${GITHUB_REPOSITORY}|g" "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" signed/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            --draft
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
   publish-pypi:
     name: publish to PyPI
-    # Only files that passed signing and the GitHub release go to PyPI.
-    needs: [sign-and-release, sdist]
+    # Only files that passed signing, verification and the GitHub release go
+    # to PyPI.
+    needs: release
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -195,18 +318,18 @@ jobs:
       id-token: write   # PyPI trusted publishing over OIDC, no API token
 
     steps:
-      - name: Download wheels
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Download signed files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: dist
-          pattern: wheel-*
-          merge-multiple: true
+          name: signed
+          path: signed
 
-      - name: Download sdist
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sdist
-          path: dist
+      - name: Keep the wheels and the sdist
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp signed/*.whl signed/*.tar.gz dist/
+          ls -la dist/
 
       - name: Publish (trusted publishing, PEP 740 attestations)
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
