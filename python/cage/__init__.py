@@ -45,7 +45,7 @@ __all__ = [
     "vault",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # Ring 2 (secret custody) is exposed lazily so it — and its native / cryptography
 # dependencies — is never imported by a bare ``import cage``. Resolving either
