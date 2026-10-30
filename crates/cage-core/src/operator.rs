@@ -16,7 +16,7 @@
 //! verifier ([`crate::gate::Gate`]) — there is no second implementation to drift.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 
 /// Domain-separation tag for the control-plane signed message. Bumped if the
 /// canonical layout ever changes, so an old signature cannot validate under a new

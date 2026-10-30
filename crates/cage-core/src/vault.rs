@@ -191,7 +191,7 @@ impl Vault {
     /// Create a new vault with a fresh OS-random 256-bit key. On UNIX, `mlock(2)`
     /// pins the key + bootstrap pages (best-effort; needs CAP_IPC_LOCK).
     pub fn new() -> Self {
-        use rand::RngCore;
+        use rand_core::RngCore;
         // Heap-allocate the key + bootstrap so their byte buffers have a STABLE
         // address. The Vault is returned by value (moved to the caller); an
         // inline [u8;32] would relocate on every move, leaving any mlock'd page
@@ -199,9 +199,7 @@ impl Vault {
         // not move when the owning struct moves, so the mlock below stays valid
         // for the life of the key.
         let mut raw_key = Zeroizing::new(vec![0u8; 32]);
-        rand::thread_rng().fill_bytes(raw_key.as_mut_slice());
         let mut bootstrap = Zeroizing::new(vec![0u8; 32]);
-        rand::thread_rng().fill_bytes(bootstrap.as_mut_slice());
 
         let mut mlock_succeeded = true;
         #[cfg(unix)]
@@ -230,9 +228,15 @@ impl Vault {
             );
         }
 
-        let mut osrng = rand::rngs::OsRng;
-        let attestation_key = SigningKey::generate(&mut osrng);
-        let release_key = SigningKey::generate(&mut osrng);
+        // Filled after the mlock call, so on success these bytes never sit in an
+        // unlocked page. getrandom writes them straight into these buffers. A
+        // userspace generator such as rand's thread_rng() keeps a copy of its
+        // output in a heap block that is never locked or wiped, which is why this
+        // crate depends on rand_core and not on rand.
+        OsRng.fill_bytes(raw_key.as_mut_slice());
+        OsRng.fill_bytes(bootstrap.as_mut_slice());
+        let attestation_key = SigningKey::generate(&mut OsRng);
+        let release_key = SigningKey::generate(&mut OsRng);
 
         Vault {
             enc_key: raw_key,

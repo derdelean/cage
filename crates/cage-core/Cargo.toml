@@ -9,7 +9,9 @@ description = "CAGE core — pure-Rust credential vault, capability gating, appe
 [dependencies]
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 zeroize = { version = "1.8", features = ["derive"] }
-rand = { version = "0.8", features = ["getrandom"] }
+# OsRng only. Not rand: its thread_rng and StdRng keep their output in a heap
+# block that is never locked or wiped, so a copy of every key would stay there.
+rand_core = { version = "0.6", features = ["getrandom"] }
 hex = "0.4"
 subtle = "2.6"
 sha2 = "0.10"
