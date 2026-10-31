@@ -27,7 +27,7 @@ crate-type = ["cdylib"]
 # the same core also runs in the standalone `cage-broker` binary with no PyO3
 # present.
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 cage-core = { path = "crates/cage-core" }
 # For the opaque `Bootstrap` handle: holds the unsealed secret in zero-on-drop
 # memory so it never crosses PyO3 as a Python `str`. Matches cage-core's pin.
