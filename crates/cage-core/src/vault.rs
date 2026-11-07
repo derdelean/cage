@@ -141,6 +141,119 @@ fn compute_entry_hash(
 }
 
 // ---------------------------------------------------------------------------
+// HMAC-SHA256 over owned state
+// ---------------------------------------------------------------------------
+
+const SHA256_BLOCK: usize = 64;
+
+/// SHA-256 initial hash value (FIPS 180-4, section 5.3.3).
+const SHA256_IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// Bytes of stack that `scrub_stack` overwrites. Measured 2026-10-26 on aarch64
+/// macOS, the decrypt and HMAC under `sign_hmac` reached about 2 KiB below it in a
+/// release build and about 14 KiB in a debug build. The rest is room for a signal
+/// frame, which saves the vector registers onto the stack.
+const STACK_SCRUB_BYTES: usize = 32 * 1024;
+
+/// Feed whole blocks of `data` to the SHA-256 compression function. Each block is
+/// passed by reference, so no copy of it is made here.
+fn sha256_compress_blocks(state: &mut [u32; 8], data: &[u8]) {
+    debug_assert_eq!(data.len() % SHA256_BLOCK, 0);
+    for block in data.chunks_exact(SHA256_BLOCK) {
+        let block: &[u8; SHA256_BLOCK] =
+            block.try_into().expect("chunks_exact yields whole blocks");
+        sha2::block_api::compress256(state, std::slice::from_ref(block));
+    }
+}
+
+/// Hash the rest of a message of `total_len` bytes: `data`, then the padding of
+/// FIPS 180-4 section 5.1.1. `state` then holds the digest. The last partial block
+/// is padded in a buffer that is zeroed on drop.
+fn sha256_finish(state: &mut [u32; 8], data: &[u8], total_len: usize) {
+    let whole = data.len() - data.len() % SHA256_BLOCK;
+    sha256_compress_blocks(state, &data[..whole]);
+    let tail = &data[whole..];
+    let mut last = Zeroizing::new([0u8; 2 * SHA256_BLOCK]);
+    last[..tail.len()].copy_from_slice(tail);
+    last[tail.len()] = 0x80;
+    // The bit length fills the last 8 bytes, so a tail of 56 bytes or more spills
+    // into a second block.
+    let end = if tail.len() < SHA256_BLOCK - 8 {
+        SHA256_BLOCK
+    } else {
+        2 * SHA256_BLOCK
+    };
+    let bit_len = total_len as u64 * 8;
+    last[end - 8..end].copy_from_slice(&bit_len.to_be_bytes());
+    sha256_compress_blocks(state, &last[..end]);
+}
+
+/// Write the digest held in `state` to `out`.
+fn sha256_digest_into(state: &[u32; 8], out: &mut [u8; 32]) {
+    for (bytes, word) in out.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+}
+
+/// HMAC-SHA256 (RFC 2104). The `sha2` hasher does not zero its chaining state and
+/// is moved by value, which leaves copies of it on the stack (three of each
+/// chaining state in a debug build). So every key-derived value here (the padded
+/// key, the chaining state, the inner digest) lives in a `Zeroizing` buffer of its
+/// own and is only passed by reference. The compression function still works on
+/// its own stack frame and in registers. `scrub_stack` covers the frame.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut state = Zeroizing::new(SHA256_IV);
+    // K0, built in the one buffer that then becomes ipad and opad in turn: the
+    // key, or H(K) when it is longer than the hash block, zero-padded.
+    let mut pad = Zeroizing::new([0u8; SHA256_BLOCK]);
+    if key.len() > SHA256_BLOCK {
+        sha256_finish(&mut state, key, key.len());
+        let head: &mut [u8; 32] = (&mut pad[..32]).try_into().expect("32 bytes");
+        sha256_digest_into(&state, head);
+    } else {
+        pad[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Zeroizing::new([0u8; 32]);
+    let mut mac = [0u8; 32];
+
+    // inner = H((K0 ^ ipad) || msg)
+    for p in pad.iter_mut() {
+        *p ^= 0x36;
+    }
+    *state = SHA256_IV;
+    sha256_compress_blocks(&mut state, &pad[..]);
+    sha256_finish(&mut state, msg, SHA256_BLOCK + msg.len());
+    sha256_digest_into(&state, &mut inner);
+
+    // mac = H((K0 ^ opad) || inner). ipad turns into opad in place.
+    for p in pad.iter_mut() {
+        *p ^= 0x36 ^ 0x5c;
+    }
+    *state = SHA256_IV;
+    sha256_compress_blocks(&mut state, &pad[..]);
+    sha256_finish(&mut state, &inner[..], SHA256_BLOCK + inner.len());
+    sha256_digest_into(&state, &mut mac);
+    mac
+}
+
+/// Overwrite the stack that a secret operation called from the same frame just
+/// used. `Zeroizing` clears the buffers it owns, but the cipher and hash code under
+/// them work on dead frames below the caller that nothing clears. What stays there
+/// depends on the build profile and the caller. On aarch64 macOS, a release build
+/// without LTO left a ChaCha20 state holding the vault's master key there, outside
+/// the mlocked pages. Call this right after the secret
+/// operation, from the frame that called it, and keep that operation
+/// `#[inline(never)]` so all of its locals lie below that frame. Registers are not
+/// cleared.
+#[inline(never)]
+fn scrub_stack() {
+    let mut area = [0u128; STACK_SCRUB_BYTES / 16];
+    area.zeroize();
+}
+
+// ---------------------------------------------------------------------------
 // Vault
 // ---------------------------------------------------------------------------
 
@@ -561,38 +674,23 @@ impl Vault {
     }
 
     /// HMAC-SHA256 sign `payload` with the secret named `secret_name`, returning
-    /// the hex signature. The key is decrypted into a `Zeroizing` buffer, used,
-    /// and zeroed — it never leaves the vault. This is the vault-held signing
-    /// operation: a caller proves authority (via a capability token) and gets a
-    /// signature back without ever holding the key.
+    /// the hex signature. This is the vault-held signing operation: a caller proves
+    /// authority (via a capability token) and gets a signature back without ever
+    /// holding the key. The key and every value derived from it live in `Zeroizing`
+    /// buffers (see `hmac_sha256`), and the stack that the decrypt and the HMAC
+    /// used is overwritten before this returns (see `scrub_stack`).
     pub fn sign_hmac(&self, secret_name: &str, payload: &[u8]) -> Result<String, CageError> {
+        let mac = self.hmac_with_secret(secret_name, payload);
+        scrub_stack();
+        mac.map(hex::encode)
+    }
+
+    /// The part of `sign_hmac` that touches the key, kept out of line so all of its
+    /// stack lies below `sign_hmac`'s frame, where `scrub_stack` reaches it.
+    #[inline(never)]
+    fn hmac_with_secret(&self, secret_name: &str, payload: &[u8]) -> Result<[u8; 32], CageError> {
         let key = self.decrypt_to_zeroizing(secret_name)?;
-        // Manual HMAC-SHA256 (RFC 2104) over Zeroizing ipad/opad blocks: the `hmac`
-        // crate keeps its key-derived inner/outer block state un-zeroed on drop, so
-        // we own and wipe every key-derived buffer here instead.
-        const BLOCK: usize = 64;
-        let mut k0 = Zeroizing::new([0u8; BLOCK]);
-        if key.len() > BLOCK {
-            // K' = H(K) when the key is longer than the hash block.
-            k0[..32].copy_from_slice(&Sha256::digest(key.as_slice()));
-        } else {
-            k0[..key.len()].copy_from_slice(&key);
-        }
-        let mut ipad = Zeroizing::new([0u8; BLOCK]);
-        let mut opad = Zeroizing::new([0u8; BLOCK]);
-        for i in 0..BLOCK {
-            ipad[i] = k0[i] ^ 0x36;
-            opad[i] = k0[i] ^ 0x5c;
-        }
-        let inner = Sha256::new()
-            .chain_update(&ipad[..])
-            .chain_update(payload)
-            .finalize();
-        let outer = Sha256::new()
-            .chain_update(&opad[..])
-            .chain_update(inner)
-            .finalize();
-        Ok(hex::encode(outer))
+        Ok(hmac_sha256(&key, payload))
     }
 
     /// Ed25519-sign a (domain-tagged, length-framed) release `statement` with the
@@ -856,14 +954,68 @@ mod tests {
 
     #[test]
     fn sign_hmac_matches_rfc4231_test_case_1() {
-        // RFC 4231 §4.2 Test Case 1: key = 0x0b×20, data = "Hi There". Pins the
-        // manual HMAC-SHA256 to the standard so the zeroize refactor cannot silently
-        // diverge from a conformant HMAC.
+        // RFC 4231 section 4.2, test case 1, through the vault path: store, decrypt,
+        // HMAC. `hmac_sha256_matches_rfc4231` covers the HMAC core itself.
         let mut v = Vault::new();
         v.store_secret("k".into(), "\u{0b}".repeat(20)).unwrap();
         assert_eq!(
             v.sign_hmac("k", b"Hi There").unwrap(),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[test]
+    fn sha256_padding_matches_sha2_for_every_length_up_to_three_blocks() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        for len in 0..=3 * SHA256_BLOCK + 1 {
+            let mut state = SHA256_IV;
+            sha256_finish(&mut state, &data[..len], len);
+            let mut digest = [0u8; 32];
+            sha256_digest_into(&state, &mut digest);
+            assert_eq!(digest[..], Sha256::digest(&data[..len])[..], "length {len}");
+        }
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        // RFC 4231 section 4, test cases 1 to 4, 6 and 7 (case 5 truncates the output).
+        let long_key = vec![0xaa; 131];
+        let cases: [(&[u8], &[u8], &str); 6] = [
+            (&[0x0b; 20], b"Hi There", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            (b"Jefe", b"what do ya want for nothing?", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            (&[0xaa; 20], &[0xdd; 50], "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"),
+            (&(1..=25).collect::<Vec<u8>>(), &[0xcd; 50], "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"),
+            (&long_key, b"Test Using Larger Than Block-Size Key - Hash Key First", "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"),
+            (&long_key, b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.", "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"),
+        ];
+        for (i, (key, msg, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                hex::encode(hmac_sha256(key, msg)),
+                *expected,
+                "case index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_sha256_matches_the_hmac_crate_around_block_boundaries() {
+        use hmac::{Hmac, Mac};
+        let lengths = [
+            0, 1, 31, 32, 55, 56, 63, 64, 65, 119, 120, 127, 128, 129, 200, 1000,
+        ];
+        let bytes: Vec<u8> = (0..1200u32).map(|i| (i * 7 + 3) as u8).collect();
+        for &k in &lengths {
+            for &m in &lengths {
+                let (key, msg) = (&bytes[..k], &bytes[100..100 + m]);
+                let mut oracle =
+                    <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(key).unwrap();
+                oracle.update(msg);
+                assert_eq!(
+                    hmac_sha256(key, msg)[..],
+                    oracle.finalize().into_bytes()[..],
+                    "key {k} bytes, message {m} bytes"
+                );
+            }
+        }
     }
 }
