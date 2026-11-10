@@ -7,8 +7,6 @@ behaviour (that lives in test_smoke.py).
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 
@@ -49,7 +47,7 @@ def test_secretvault_public_methods_present() -> None:
         "store_secret", "load_from_env_file", "has_secret", "delete_secret",
         "configure", "register_scope_secret",
         "unseal", "is_unsealed", "issue_token", "revoke",
-        "consume", "invoke_llm",
+        "sign", "invoke_llm",
         "audit_chain_valid", "get_audit_log", "audit_head",
         "attestation_payload", "attestation_public_key", "record_attestation",
     ):
@@ -61,14 +59,15 @@ def test_end_to_end_lifecycle_surface() -> None:
     """One pass through the canonical flow, asserting the shapes callers rely on."""
     from cage import CapabilityToken, SecretVault
 
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test")
-    tok = v.issue_token(scope="llm.evaluate", context="api-test", max_uses=2)
+    v = SecretVault(insecure_dev_mode=True)
+    if v.backend != "rust":
+        pytest.skip("sign() is Rust-backend only")
+    v.store_secret("hmac_key", "k-test")
+    v.register_scope_secret("sign.", "hmac_key")
+    tok = v.issue_token(scope="sign.api", context="api-test", max_uses=2)
     assert isinstance(tok, CapabilityToken)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert v.consume(tok, "llm.evaluate") == "sk-test"
+    assert len(v.sign(tok, b"payload")) == 64
 
     assert v.revoke(tok.token_id) is True
     assert v.audit_chain_valid() is True

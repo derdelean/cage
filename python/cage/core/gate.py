@@ -150,7 +150,7 @@ class Gate:
         to the secret stored under "llm_api_key".
         """
         if self._has_rust_authority:
-            # Resolution happens in Rust (invoke/consume/sign), so the registry
+            # Resolution happens in Rust (invoke/sign), so the registry
             # must live there.
             self._secure_backend.register_scope_secret(scope_prefix, secret_name)
             return

@@ -370,23 +370,6 @@ impl Vault {
         self.encrypt_and_store(name, plaintext_bytes.as_slice())
     }
 
-    /// Decrypt and return the stored secret as a `String` (deprecated path —
-    /// prefer `invoke`, which never materializes plaintext outside the vault).
-    pub fn retrieve_secret(&self, name: &str) -> Result<String, CageError> {
-        let plaintext_bytes = self.decrypt_to_zeroizing(name)?;
-        match String::from_utf8(plaintext_bytes.to_vec()) {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                // The FromUtf8Error owns the (non-Zeroizing) plaintext Vec — wipe it
-                // before it is freed, otherwise a binary or corrupt-but-authenticating
-                // secret leaks 100% of the time on this error path.
-                let mut leaked = e.into_bytes();
-                leaked.zeroize();
-                Err(CageError::Crypto("secret is not valid UTF-8".into()))
-            }
-        }
-    }
-
     /// True if a secret with this name is stored.
     pub fn has_secret(&self, name: &str) -> bool {
         self.store.contains_key(name)

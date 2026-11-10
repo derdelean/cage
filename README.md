@@ -77,6 +77,14 @@ response = await vault.invoke_llm(token, {
     "max_tokens": 200,
     "messages": [{"role": "user", "content": "..."}],
 })
+
+# Signing scopes: HMAC-SHA256 with the credential the scope resolves to. The
+# agent gets a hex signature, the key stays in Rust. No method returns a secret.
+vault.register_scope_secret("sign.", "hmac_key")   # a secret loaded like the API key
+sign_token = vault.issue_token(
+    scope="sign.invoices", context="billing", max_uses=1, bootstrap_token=bootstrap,
+)
+signature = vault.sign(sign_token, b"invoice #1001 :: 4200.00 CHF")
 ```
 
 For the strongest containment, run the out-of-process **broker**. The key lives in a separate process and the agent holds only token IDs. `cage.broker.spawn_broker` starts it, and `cage.adapters.CagedAnthropic` / `CagedOpenAI` take the provider SDKs' call shape (they return the provider's JSON as a dict). The broker needs an issuance policy, so set `CAGE_ISSUANCE_SCOPES` (for example `llm.,sign.`) before you start it. See [`examples/broker_demo.py`](./examples/broker_demo.py), which drives a real agent child process that is refused every escalation, and [`examples/agent_broker_adapter.py`](./examples/agent_broker_adapter.py). Read [DEPLOY.md](./DEPLOY.md) before running the broker in production: it only keeps the key from a same-user agent when the agent cannot control how the broker starts.
@@ -108,7 +116,6 @@ These are the gaps as of v0.1. Reports and fixes are welcome (see [SECURITY.md](
 - The provider pin binds a secret's name, and secrets are unpinned by default.
 - The CA allowlist filters on the root CA only, by organization name. Subordinate CAs run by other organizations under an admitted root are accepted, and revocation is not checked.
 - In-process, `register_scope_secret` and the audit writer need no authority. In-process code is trusted. The broker exposes neither.
-- `vault.consume()` still exists for scopes without a Rust transport. It is deprecated, refused by default, and will be removed before 1.0.
 
 ## Verifying signed releases
 

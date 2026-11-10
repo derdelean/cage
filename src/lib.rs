@@ -12,9 +12,9 @@ The Python-visible object is the **`Gate`**, not the bare vault: the credential
 store and the capability authority are the *same* Rust object, so the token check
 and the secret use are one atomic operation that no in-process Python code can
 step around. There is deliberately **no** un-gated `retrieve_secret` / raw
-`invoke` on this surface — the only paths to a secret value are the token-gated
-`invoke` (zero-plaintext, key never crosses PyO3) and the deprecated, still
-token-gated `consume`.
+`invoke` on this surface, and no operation returns a stored secret at all. The
+only uses of a secret are the token-gated `invoke` and `sign`, and on both the
+key never crosses PyO3.
 
 The `Gate` is held behind a `Mutex` so every method borrows the pyclass as
 `&self` (shared). `invoke` reserves a use + decrypts under the lock, **releases
@@ -79,15 +79,12 @@ impl RustGate {
 #[pymethods]
 impl RustGate {
     /// Construct a gate. `insecure_dev_mode` waives the bootstrap requirement on
-    /// issuance/revocation; `allow_plaintext_consume` re-enables the deprecated
-    /// `consume()` leak. Both are development/tests ONLY, and both are constructor
-    /// arguments with no setter, so neither can be flipped from Python once the gate exists.
-    /// They are separate switches on purpose — see `Gate::set_allow_plaintext_consume`.
+    /// issuance/revocation. Development and tests ONLY. It is a constructor
+    /// argument with no setter, so it cannot be flipped from Python once the gate exists.
     #[new]
-    pub fn new(insecure_dev_mode: bool, allow_plaintext_consume: bool) -> Self {
+    pub fn new(insecure_dev_mode: bool) -> Self {
         let mut gate = Gate::new();
         gate.set_insecure_dev_mode(insecure_dev_mode);
-        gate.set_allow_plaintext_consume(allow_plaintext_consume);
         RustGate(Mutex::new(gate))
     }
 
@@ -255,13 +252,6 @@ impl RustGate {
                 Err(to_py(CageError::from(e)))
             }
         }
-    }
-
-    /// Deprecated token-gated plaintext retrieval. Token-gated (authorize + charge
-    /// + audit), but returns the secret as a Python `str` — the bytes cross PyO3 and
-    /// persist in CPython's interned-string heap. Removed before 1.0.
-    pub fn consume(&self, token_id: &str, scope: &str) -> PyResult<String> {
-        self.lock().consume(token_id, scope).map_err(to_py)
     }
 
     /// HMAC-SHA256 sign with the vault-held key for the token's scope. The key
