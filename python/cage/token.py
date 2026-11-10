@@ -38,7 +38,7 @@ class CapabilityToken:
     issued_at   : UTC timestamp at issue time
     ttl_seconds : hard expiry
     max_uses    : cumulative use ceiling (Invariant 3)
-    use_count   : incremented on each consume()/invoke_llm(); never decremented
+    use_count   : incremented on each sign()/invoke_llm(); never decremented
     revoked     : True if vault.revoke() was called on this token
 
     ``scope`` and ``context`` are required; the rest carry defaults. (Dataclass

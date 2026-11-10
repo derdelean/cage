@@ -9,7 +9,6 @@ Each test reproduces one of the live PoCs and asserts it is now defeated.
 from __future__ import annotations
 
 import threading
-import warnings
 
 import pytest
 
@@ -25,9 +24,11 @@ def test_no_token_less_backend_bypass() -> None:
         pytest.skip("the un-gated bypass closure is Rust-backend specific")
     v.store_secret("llm_api_key", "sk-ant-SECRET")
 
-    # The ungated plaintext readers are gone from the native surface.
+    # The plaintext readers are gone from the native surface, the ungated ones
+    # and the token-gated consume() alike.
     assert not hasattr(v._backend, "retrieve_secret")
     assert not hasattr(v._backend, "decrypt_secret")
+    assert not hasattr(v._backend, "consume")
 
     # The only native invoke is token-gated: a fabricated token_id is refused
     # (structural refusal) before any network call or key decryption.
@@ -74,24 +75,25 @@ def test_fail_closed_revoke_needs_bootstrap() -> None:
     assert v.revoke(token.token_id, bootstrap_token=bootstrap) is True
 
 
-def test_concurrent_consume_does_not_double_spend() -> None:
+def test_concurrent_sign_does_not_double_spend() -> None:
     """PoC3: concurrent use of a max_uses=1 token used to succeed N times because
     authorize and record_use straddled the await non-atomically. The Rust gate
     charges the use atomically, so a max_uses=1 token is spent exactly once even
     under concurrency."""
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-secret-value")
-    token = v.issue_token(scope="llm.evaluate", context="race", max_uses=1)
+    v = SecretVault(insecure_dev_mode=True)
+    if v.backend != "rust":
+        pytest.skip("the atomic charge is enforced on the Rust authority")
+    v.store_secret("hmac_key", "k-secret-value")
+    v.register_scope_secret("sign.", "hmac_key")
+    token = v.issue_token(scope="sign.race", context="race", max_uses=1)
 
     results: list[str | None] = []
 
     def worker() -> None:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            try:
-                results.append(v.consume(token, "llm.evaluate"))
-            except CageViolation:
-                results.append(None)
+        try:
+            results.append(v.sign(token, b"payload"))
+        except CageViolation:
+            results.append(None)
 
     threads = [threading.Thread(target=worker) for _ in range(8)]
     for t in threads:
@@ -99,21 +101,22 @@ def test_concurrent_consume_does_not_double_spend() -> None:
     for t in threads:
         t.join()
 
-    succeeded = [r for r in results if r == "sk-secret-value"]
+    succeeded = [r for r in results if r is not None]
     assert len(succeeded) == 1, (
         f"max_uses=1 token was spent {len(succeeded)} times — double-spend"
     )
 
 
-def test_forged_token_cannot_drive_invoke_or_consume() -> None:
+def test_forged_token_cannot_drive_sign() -> None:
     """Structural refusal on the shipped path: a fabricated CapabilityToken the
     vault never issued unlocks nothing, even though the type is constructable."""
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test")
-    forged = CapabilityToken(scope="llm.evaluate", context="attacker", max_uses=10)
+    v = SecretVault(insecure_dev_mode=True)
+    if v.backend != "rust":
+        pytest.skip("sign() is Rust-backend only")
+    v.store_secret("hmac_key", "k-test")
+    v.register_scope_secret("sign.", "hmac_key")
+    forged = CapabilityToken(scope="sign.x", context="attacker", max_uses=10)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(CageViolation):
-            v.consume(forged, "llm.evaluate")
+    with pytest.raises(CageViolation):
+        v.sign(forged, b"payload")
     assert v.audit_chain_valid()

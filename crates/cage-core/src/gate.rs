@@ -297,12 +297,6 @@ pub struct Gate {
     /// When true, token issuance/revocation do NOT require the bootstrap token.
     /// Development/testing ONLY — production stays fail-closed (the default).
     insecure_dev_mode: bool,
-    /// When true, [`Gate::consume`] may hand plaintext back to the caller.
-    /// Development ONLY — and deliberately **separate** from `insecure_dev_mode`:
-    /// the switch that re-enables the deprecated leak must not be the same switch
-    /// that waives control-plane auth, or restoring `consume()` would silently
-    /// unlock issuance/revocation too.
-    allow_plaintext_consume: bool,
     /// Monotonic issue stamp per token — the TTL is enforced against this, not the
     /// wallclock, so a host clock rollback cannot revive or extend a token.
     token_issued_at: HashMap<String, Instant>,
@@ -337,7 +331,6 @@ impl Gate {
             policy_fingerprint: None,
             issued_per_entry: HashMap::new(),
             insecure_dev_mode: false,
-            allow_plaintext_consume: false,
             token_issued_at: HashMap::new(),
             operator_keys: Vec::new(),
             cp_nonces: HashMap::new(),
@@ -395,20 +388,6 @@ impl Gate {
         self.insecure_dev_mode = enabled;
         if enabled {
             self.audit("vault", "insecure_dev_mode_enabled", &serde_json::json!({}));
-        }
-    }
-
-    /// Enable the deprecated plaintext [`Gate::consume`] path. Development ONLY;
-    /// same construction-only contract and chain entry as
-    /// [`Gate::set_insecure_dev_mode`].
-    ///
-    /// It is a switch of its own rather than a facet of `insecure_dev_mode` on
-    /// purpose: an integrator who needs the leak for a scope with no gated
-    /// operation yet must not have to waive control-plane auth to get it.
-    pub fn set_allow_plaintext_consume(&mut self, enabled: bool) {
-        self.allow_plaintext_consume = enabled;
-        if enabled {
-            self.audit("vault", "plaintext_consume_enabled", &serde_json::json!({}));
         }
     }
 
@@ -929,49 +908,6 @@ impl Gate {
         );
     }
 
-    /// Token-gated plaintext retrieval — the deprecated `consume` path. Authorizes
-    /// against `requested_scope`, charges a use, audits, and returns the secret as a
-    /// String. The plaintext crosses the binding boundary here; this is the
-    /// deprecated leak path, kept **token-gated** until per-provider transports
-    /// replace it (so it is never an *un*gated bypass like the old raw retrieve).
-    ///
-    /// **Off unless [`Gate::set_allow_plaintext_consume`] was set.** Because it
-    /// hands plaintext back into the caller's address space, a gate refuses it
-    /// structurally by default — so the "no plaintext key in the agent" property
-    /// holds for a gate built at the defaults, regardless of the deprecation. The
-    /// switch is same-trust-domain hygiene, not a boundary: a caller who controls
-    /// construction can build a gate with it on. The token is authorized first,
-    /// so the refusal — audited like every other — is keyed on a validated token
-    /// and a forged one is rejected as unknown, exactly as on the other ops. Full
-    /// removal follows once every provider a customer needs has a Rust transport.
-    pub fn consume(&mut self, token_id: &str, requested_scope: &str) -> Result<String, CageError> {
-        self.authorize(token_id, Some(requested_scope), None)?;
-        if !self.allow_plaintext_consume {
-            self.audit(
-                token_id,
-                "consume_refused_plaintext_disabled",
-                &serde_json::json!({ "scope": requested_scope }),
-            );
-            return Err(CageError::Refused(
-                "consume() returns plaintext into the caller's address space and is \
-                 disabled by default. Use a gated op that keeps the key in the \
-                 vault — invoke for LLM scopes, sign for signing scopes; a scope \
-                 with neither is not production-supported."
-                    .to_string(),
-            ));
-        }
-        let secret = self.resolve_secret_for(token_id, requested_scope)?;
-        let uses = self.record_use(token_id)?;
-        let value = self.vault.retrieve_secret(&secret)?;
-        // Fail-closed: the plaintext is returned only once its audit entry exists.
-        self.audit_checked(
-            token_id,
-            "consumed",
-            &serde_json::json!({"scope": requested_scope, "use_count": uses}),
-        )?;
-        Ok(value)
-    }
-
     /// Configure the release-signing policy (control plane). The requester never
     /// supplies the policy — a compromised CI must not be able to relax it.
     pub fn set_release_policy(&mut self, policy: ReleasePolicy) {
@@ -1311,7 +1247,7 @@ impl Gate {
 
     /// Fail-closed audit: like [`audit`](Self::audit) but propagates an append
     /// failure instead of swallowing it. Used on the secret-materializing success
-    /// paths (`sign` / `invoke` / `consume` / `sign_release`) so a secret-derived
+    /// paths (`sign` / `invoke` / `sign_release`) so a secret-derived
     /// result is never returned to the caller without its audit-chain entry — the
     /// append is part of the operation, not best-effort. In practice `append_audit`
     /// only fails on malformed JSON, which the gate never constructs, so this never
@@ -1553,96 +1489,9 @@ mod tests {
     }
 
     #[test]
-    fn consume_is_token_gated_and_use_counted() {
-        let mut g = gate_with_secret();
-        g.set_allow_plaintext_consume(true);
-        let t = g.issue_token("sign.x", "c", None, Some(1), None).unwrap();
-        assert_eq!(
-            g.consume(&t.token_id, "sign.x").unwrap(),
-            "super-secret-value"
-        );
-        // Over max_uses → refused (no second plaintext).
-        assert!(matches!(
-            g.consume(&t.token_id, "sign.x").unwrap_err(),
-            CageError::Refused(_)
-        ));
-    }
-
-    #[test]
-    fn consume_refused_unless_plaintext_is_explicitly_allowed() {
-        // A sealed, default-built gate (no dev mode, no leak switch) refuses
-        // consume() on a legitimately issued token — the plaintext-into-the-caller
-        // path is opt-in only.
-        let mut g = sealed_gate_with_secret();
-        let bootstrap = g.unseal().unwrap();
-        let t = g
-            .issue_token(
-                "sign.x",
-                "c",
-                None,
-                Some(1),
-                Some(ControlAuth::Bootstrap(&bootstrap)),
-            )
-            .unwrap();
-        assert!(matches!(
-            g.consume(&t.token_id, "sign.x").unwrap_err(),
-            CageError::Refused(_)
-        ));
-        assert!(g
-            .audit_log_snapshot()
-            .iter()
-            .any(|e| e.event == "consume_refused_plaintext_disabled" && e.entity_id == t.token_id));
-    }
-
-    #[test]
-    fn consume_on_a_forged_token_is_rejected_as_unknown_even_when_disabled() {
-        // authorize() runs before the switch check, so a forged probe is recorded
-        // the way every other op records it — not as a plaintext refusal keyed on
-        // an attacker-chosen id.
-        let mut g = sealed_gate_with_secret();
-        assert!(matches!(
-            g.consume(&"00".repeat(16), "sign.x").unwrap_err(),
-            CageError::Refused(_)
-        ));
-        let log = g.audit_log_snapshot();
-        assert!(log.iter().any(|e| e.event == "rejected_unknown_token"));
-        assert!(!log
-            .iter()
-            .any(|e| e.event == "consume_refused_plaintext_disabled"));
-    }
-
-    #[test]
-    fn insecure_dev_mode_alone_does_not_re_enable_consume() {
-        // The two switches are decoupled: waiving control-plane auth must not also
-        // restore the plaintext path, or the escape hatch for one becomes the
-        // detonator for the other. `gate_with_secret()` is already in dev mode.
-        let mut g = gate_with_secret();
-        assert!(g.verify_control_auth("issue", b"", None), "dev mode is on");
-        let t = g.issue_token("sign.x", "c", None, Some(1), None).unwrap();
-        assert!(matches!(
-            g.consume(&t.token_id, "sign.x").unwrap_err(),
-            CageError::Refused(_)
-        ));
-    }
-
-    #[test]
-    fn plaintext_consume_alone_does_not_waive_control_auth() {
-        // The inverse direction of the decoupling: opting into the leak must not
-        // also waive control-plane auth.
-        let mut g = sealed_gate_with_secret();
-        g.set_allow_plaintext_consume(true);
-        assert!(!g.verify_control_auth("issue", b"", None));
-        assert!(matches!(
-            g.issue_token("sign.x", "c", None, Some(1), None)
-                .unwrap_err(),
-            CageError::Refused(_)
-        ));
-    }
-
-    #[test]
-    fn enabling_a_dev_switch_is_recorded_on_the_chain() {
-        // A default gate's chain carries neither entry; enabling a waiver writes one
-        // before anything can be issued or consumed under it.
+    fn enabling_the_dev_switch_is_recorded_on_the_chain() {
+        // A default gate's chain carries no such entry. Enabling the waiver writes
+        // one before anything can be issued under it.
         let g = Gate::new();
         let ev = |g: &Gate, name: &str| {
             g.audit_log_snapshot()
@@ -1651,37 +1500,11 @@ mod tests {
                 .count()
         };
         assert_eq!(ev(&g, "insecure_dev_mode_enabled"), 0);
-        assert_eq!(ev(&g, "plaintext_consume_enabled"), 0);
         let mut g = Gate::new();
         g.set_insecure_dev_mode(false);
-        g.set_allow_plaintext_consume(false);
-        assert_eq!(g.audit_log_len(), 0, "the default-false calls stay silent");
+        assert_eq!(g.audit_log_len(), 0, "the default-false call stays silent");
         g.set_insecure_dev_mode(true);
-        g.set_allow_plaintext_consume(true);
         assert_eq!(ev(&g, "insecure_dev_mode_enabled"), 1);
-        assert_eq!(ev(&g, "plaintext_consume_enabled"), 1);
-        assert!(g.verify_audit_chain());
-    }
-
-    #[test]
-    fn consume_refusal_is_audited() {
-        // A refused consume() must leave a chain entry like every other refusal in
-        // the gate — otherwise a compromised agent could probe the raw-key path in
-        // production with zero trace (invariant 4).
-        let mut g = gate_with_secret();
-        let t = g.issue_token("sign.x", "c", None, Some(1), None).unwrap();
-        assert!(matches!(
-            g.consume(&t.token_id, "sign.x").unwrap_err(),
-            CageError::Refused(_)
-        ));
-        let log = g.audit_log_snapshot();
-        let refusals: Vec<_> = log
-            .iter()
-            .filter(|e| e.event == "consume_refused_plaintext_disabled")
-            .collect();
-        assert_eq!(refusals.len(), 1);
-        assert_eq!(refusals[0].entity_id, t.token_id);
-        assert!(refusals[0].data_json.contains("\"scope\":\"sign.x\""));
         assert!(g.verify_audit_chain());
     }
 

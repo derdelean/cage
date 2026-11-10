@@ -4,6 +4,7 @@ longer silently downgrades:
   #13 invoke_llm fails closed off the Rust backend instead of leaking the key.
   #7  audit_chain_signed marks the unsigned fallback; strict_backend fails closed.
   #10 unseal() warns that the bootstrap crosses PyO3 as an un-zeroable str.
+  2026-11-09: sign() fails closed off the Rust backend, as invoke_llm does.
 """
 
 from __future__ import annotations
@@ -29,6 +30,31 @@ def test_invoke_llm_fails_closed_off_rust_backend() -> None:
     v._backend_name = "python"
     with pytest.raises(CageViolation):
         asyncio.run(v.invoke_llm(tok, {"model": "m", "messages": []}))
+    # The refusal is on the chain, keyed on the validated token (Invariant 4).
+    refusals = [
+        e for e in v.get_audit_log() if e["event"] == "invoke_refused_no_rust_backend"
+    ]
+    assert [e["entity_id"] for e in refusals] == [tok.token_id]
+
+
+def test_sign_fails_closed_off_rust_backend() -> None:
+    """sign() keeps the key in Rust only on the Rust backend. Off it, the method
+    must refuse rather than read the key into Python to compute the HMAC."""
+    v = SecretVault(insecure_dev_mode=True)
+    if v.backend != "rust":
+        pytest.skip("simulating the non-Rust path requires the Rust build present")
+    v.store_secret("hmac_key", "k")
+    v.register_scope_secret("sign.", "hmac_key")
+    tok = v.issue_token(scope="sign.x", context="t")
+
+    v._backend_name = "python"
+    with pytest.raises(CageViolation):
+        v.sign(tok, b"payload")
+    refusals = [
+        e for e in v.get_audit_log() if e["event"] == "sign_refused_no_rust_backend"
+    ]
+    assert [e["entity_id"] for e in refusals] == [tok.token_id]
+    assert not any(e["event"] == "signed" for e in v.get_audit_log())
 
 
 def test_audit_chain_signed_marks_the_backend() -> None:

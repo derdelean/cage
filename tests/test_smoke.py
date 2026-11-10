@@ -5,9 +5,26 @@ backend (Rust or Python) is loaded.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 import pytest
 
 from cage import CapabilityToken, CageViolation, SecretVault
+
+
+def _rust_only(v: SecretVault) -> None:
+    if v.backend != "rust":
+        pytest.skip("the gated sign() op is Rust-backend only")
+
+
+def _signing_vault() -> SecretVault:
+    """A dev vault with an HMAC key registered under the ``sign.`` namespace."""
+    v = SecretVault(insecure_dev_mode=True)
+    _rust_only(v)
+    v.store_secret("hmac_key", "k-test-12345")
+    v.register_scope_secret("sign.", "hmac_key")
+    return v
 
 
 def test_backend_is_rust_or_python() -> None:
@@ -30,147 +47,86 @@ def test_store_and_token_lifecycle() -> None:
     assert token.remaining_uses() == 3
 
 
-def test_consume_increments_use_count() -> None:
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test-12345")
-    token = v.issue_token(scope="llm.evaluate", context="t", max_uses=2)
+def test_sign_increments_use_count() -> None:
+    v = _signing_vault()
+    token = v.issue_token(scope="sign.invoice", context="t", max_uses=2)
 
-    import warnings
+    sig1 = v.sign(token, b"invoice #1")
+    sig2 = v.sign(token, b"invoice #1")
+    assert sig1 == sig2
+    assert len(sig1) == 64
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert v.consume(token, "llm.evaluate") == "sk-test-12345"
-        assert v.consume(token, "llm.evaluate") == "sk-test-12345"
-
-        # Third consume should raise — exceeded max_uses.
-        with pytest.raises(CageViolation):
-            v.consume(token, "llm.evaluate")
+    # The third use exceeds max_uses.
+    with pytest.raises(CageViolation):
+        v.sign(token, b"invoice #1")
 
     # The use counter is authoritative on the vault side, not on the caller's
-    # (frozen, stale) handle — verify the progression via the audit chain.
-    consumed = [e for e in v.get_audit_log() if e["event"] == "consumed"]
-    assert [e["data"]["use_count"] for e in consumed] == [1, 2]
+    # (frozen, stale) handle. Verify the progression via the audit chain.
+    signed = [e for e in v.get_audit_log() if e["event"] == "signed"]
+    assert [e["data"]["use_count"] for e in signed] == [1, 2]
 
 
-def test_consume_refused_by_default() -> None:
-    # A vault at the shipped defaults must refuse consume() structurally — the
-    # plaintext-str leak path is opt-in only, so "no plaintext key in the agent"
-    # holds in production regardless of the deprecation.
-    v = SecretVault()
+def test_wrong_operation_class_is_refused_and_audited() -> None:
+    # An llm.* token cannot drive sign(). The gate refuses before it resolves any
+    # secret, charges nothing, and records the refusal with the operation it saw.
+    v = SecretVault(insecure_dev_mode=True)
+    _rust_only(v)
     v.store_secret("llm_api_key", "sk-test-12345")
-    bootstrap = v.unseal()
-    token = v.issue_token(
-        scope="llm.evaluate", context="t", max_uses=1, bootstrap_token=bootstrap
-    )
+    token = v.issue_token(scope="llm.evaluate", context="t", max_uses=1)
     with pytest.raises(CageViolation):
-        v.consume(token, "llm.evaluate")
-    # The refusal is on the chain, like every other refusal in the gate.
-    refused = [
-        e for e in v.get_audit_log()
-        if e["event"] == "consume_refused_plaintext_disabled"
-    ]
-    assert len(refused) == 1
-    assert refused[0]["entity_id"] == token.token_id
-    expected = {"scope": "llm.evaluate"}
-    if v.backend != "rust":
-        expected["layer"] = "facade"  # the fallback's guard writes via the facade
-    assert refused[0]["data"] == expected
-    assert v.audit_chain_valid()
+        v.sign(token, b"payload")
+    refusals = [e for e in v.get_audit_log() if e["event"] == "rejected_wrong_verb"]
+    assert len(refusals) == 1
+    assert refusals[0]["entity_id"] == token.token_id
+    assert refusals[0]["data"] == {"scope": "llm.evaluate", "operation": "sign"}
+    assert not any(e["event"] == "signed" for e in v.get_audit_log())
 
 
-def test_core_refuses_consume_when_facade_guard_is_bypassed() -> None:
-    # The Rust core, not the facade flag, is the enforcement point: the facade
-    # attribute is not consulted on the Rust backend, so flipping it changes
-    # nothing — the core refuses and writes the refusal to the chain itself, and
-    # a refusal never emits the plaintext DeprecationWarning.
-    v = SecretVault()
-    if v.backend != "rust":
-        pytest.skip("the core guard is Rust-backend only")
-    v.store_secret("llm_api_key", "sk-test-12345")
-    bootstrap = v.unseal()
-    token = v.issue_token(
-        scope="llm.evaluate", context="t", max_uses=1, bootstrap_token=bootstrap
-    )
-    v._allow_plaintext_consume = True  # not consulted on the Rust backend
-
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)  # a refusal must not warn
-        with pytest.raises(CageViolation):
-            v.consume(token, "llm.evaluate")
-    refused = [
-        e for e in v.get_audit_log()
-        if e["event"] == "consume_refused_plaintext_disabled"
-    ]
-    assert len(refused) == 1, "written by the core — the facade guard was bypassed"
-    assert refused[0]["entity_id"] == token.token_id
-    assert refused[0]["data"] == {"scope": "llm.evaluate"}, "no facade layer tag"
+def test_sign_rejects_a_non_bytes_payload() -> None:
+    # bytes(5) is five zero bytes, so an int must not be coerced into a payload.
+    v = _signing_vault()
+    token = v.issue_token(scope="sign.invoice", context="t", max_uses=1)
+    with pytest.raises(TypeError):
+        v.sign(token, 5)  # type: ignore[arg-type]
+    assert not any(e["event"] == "signed" for e in v.get_audit_log())
+    # The refused call charged nothing: the single use is still available.
+    assert len(v.sign(token, b"ok")) == 64
 
 
-def test_dev_switches_are_recorded_on_the_chain() -> None:
-    # A default vault's chain carries neither entry; a dev vault's chain says up
-    # front which waivers were on, before any token is issued under them.
+def test_no_operation_returns_a_stored_secret() -> None:
+    # The in-process surface has no call that hands a stored credential back to
+    # Python. The gated operations return a signature or a provider response.
+    for name in ("consume", "retrieve_secret", "get_secret", "decrypt_secret"):
+        assert not hasattr(SecretVault, name), f"SecretVault.{name} must not exist"
+
+
+def test_dev_switch_is_recorded_on_the_chain() -> None:
+    # A default vault's chain carries no such entry. A dev vault's chain says up
+    # front that the waiver was on, before any token is issued under it.
     events = lambda v: [e["event"] for e in v.get_audit_log()]
     prod = SecretVault()
     if prod.backend != "rust":
         pytest.skip("switch audit is Rust-backend only")
     assert "insecure_dev_mode_enabled" not in events(prod)
-    assert "plaintext_consume_enabled" not in events(prod)
-    dev = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
+    dev = SecretVault(insecure_dev_mode=True)
     assert events(dev).count("insecure_dev_mode_enabled") == 1
-    assert events(dev).count("plaintext_consume_enabled") == 1
     assert dev.audit_chain_valid()
 
 
-def test_insecure_dev_mode_alone_does_not_re_enable_consume() -> None:
-    # The two switches are decoupled: waiving control-plane auth must not also
-    # restore the plaintext path, or the escape hatch for one becomes the
-    # detonator for the other.
-    v = SecretVault(insecure_dev_mode=True)
-    v.store_secret("llm_api_key", "sk-test-12345")
-    token = v.issue_token(scope="llm.evaluate", context="t", max_uses=1)
-    with pytest.raises(CageViolation):
-        v.consume(token, "llm.evaluate")
-
-
-def test_plaintext_consume_alone_does_not_waive_control_auth() -> None:
-    # The inverse direction of the decoupling: opting into the leak must not also
-    # waive the bootstrap requirement on issuance.
-    v = SecretVault(allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test-12345")
-    v.unseal()
-    with pytest.raises(CageViolation):
-        v.issue_token(scope="llm.evaluate", context="attacker")
-
-
 def test_non_bool_insecure_dev_mode_is_refused_not_coerced() -> None:
-    # Same rule for the other loosening switch: a truthy "false" must not waive
-    # control-plane auth on a vault its operator believes is fail-closed.
+    # A config- or env-sourced "false" is truthy in Python. Coercing it would
+    # silently waive control-plane auth on a vault its operator believes is
+    # fail-closed, so construction refuses anything that is not a real bool.
     with pytest.raises(CageViolation):
         SecretVault(insecure_dev_mode="false")  # type: ignore[arg-type]
 
 
-def test_non_bool_allow_plaintext_consume_is_refused_not_coerced() -> None:
-    # A config- or env-sourced "false" is truthy in Python. Coercing it would
-    # silently enable the plaintext path on a vault its operator believes is
-    # fail-closed, so construction refuses anything that is not a real bool.
-    with pytest.raises(CageViolation):
-        SecretVault(allow_plaintext_consume="false")  # type: ignore[arg-type]
-
-
-def test_revoke_blocks_consume() -> None:
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test-12345")
-    token = v.issue_token(scope="llm.evaluate", context="t")
+def test_revoke_blocks_sign() -> None:
+    v = _signing_vault()
+    token = v.issue_token(scope="sign.invoice", context="t")
     assert v.revoke(token.token_id) is True
-
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(CageViolation):
-            v.consume(token, "llm.evaluate")
+    with pytest.raises(CageViolation):
+        v.sign(token, b"invoice #1")
 
 
 # ---------------------------------------------------------------------------
@@ -178,21 +134,15 @@ def test_revoke_blocks_consume() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_forged_token_rejected_by_consume() -> None:
+def test_forged_token_rejected_by_sign() -> None:
     """A CapabilityToken the vault never issued must not unlock a secret,
     even though it is a public, constructable type (Invariant 6)."""
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("llm_api_key", "sk-test-12345")
+    v = _signing_vault()
     forged = CapabilityToken(
-        scope="llm.evaluate", context="attacker", max_uses=999_999
+        scope="sign.invoice", context="attacker", max_uses=999_999
     )
-
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(CageViolation):
-            v.consume(forged, "llm.evaluate")
+    with pytest.raises(CageViolation):
+        v.sign(forged, b"invoice #1")
 
     log = v.get_audit_log()
     assert any(e["event"] == "rejected_unknown_token" for e in log)
@@ -292,30 +242,30 @@ def test_audit_chain_detects_tampering() -> None:
 
 
 def test_unknown_scope_raises() -> None:
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
+    v = SecretVault(insecure_dev_mode=True)
+    _rust_only(v)
     v.store_secret("llm_api_key", "sk-test-12345")
-    token = v.issue_token(scope="kubernetes.deploy", context="t")
-
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(CageViolation):
-            v.consume(token, "kubernetes.deploy")
+    # Nothing is registered under "sign.", so the scope resolves to no secret.
+    token = v.issue_token(scope="sign.deploy", context="t")
+    with pytest.raises(CageViolation):
+        v.sign(token, b"x")
+    assert any(e["event"] == "rejected_unknown_scope" for e in v.get_audit_log())
 
 
 def test_register_scope_secret() -> None:
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.store_secret("aws_session_token", "ASIAEXAMPLE")
-    v.register_scope_secret("bedrock.", "aws_session_token")
+    v = SecretVault(insecure_dev_mode=True)
+    _rust_only(v)
+    v.store_secret("release_key", "ASIAEXAMPLE")
+    v.register_scope_secret("sign.release.", "release_key")
+    token = v.issue_token(scope="sign.release.v1", context="t")
 
-    token = v.issue_token(scope="bedrock.invoke", context="t")
-
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert v.consume(token, "bedrock.invoke") == "ASIAEXAMPLE"
+    sig = v.sign(token, b"artifact")
+    # The signature was made with the registered secret, which never came back to
+    # Python. Recompute it here from the known test value.
+    expected = hmac.new(b"ASIAEXAMPLE", b"artifact", hashlib.sha256).hexdigest()
+    assert sig == expected
+    # A str payload is signed as its UTF-8 bytes.
+    assert v.sign(token, "artifact") == expected
 
 
 # ---------------------------------------------------------------------------
@@ -501,18 +451,18 @@ def test_load_from_env_file_basic(tmp_path) -> None:
 
 
 def test_load_from_env_file_secret_recoverable(tmp_path) -> None:
-    """Verify the encrypted secret round-trips correctly via consume()."""
+    """The encrypted secret round-trips: a signature made with it equals one
+    computed from the known plaintext, and the secret never came back to Python."""
     env_file = tmp_path / ".env"
-    env_file.write_text("llm_api_key=sk-roundtrip-99\n")
-    v = SecretVault(insecure_dev_mode=True, allow_plaintext_consume=True)
-    v.load_from_env_file(str(env_file), ["llm_api_key"])
+    env_file.write_text("hmac_key=k-roundtrip-99\n")
+    v = SecretVault(insecure_dev_mode=True)
+    _rust_only(v)
+    v.load_from_env_file(str(env_file), ["hmac_key"])
+    v.register_scope_secret("sign.", "hmac_key")
 
-    token = v.issue_token(scope="llm.evaluate", context="t", max_uses=1)
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        assert v.consume(token, "llm.evaluate") == "sk-roundtrip-99"
+    token = v.issue_token(scope="sign.check", context="t", max_uses=1)
+    expected = hmac.new(b"k-roundtrip-99", b"probe", hashlib.sha256).hexdigest()
+    assert v.sign(token, b"probe") == expected
 
 
 def test_load_from_env_file_missing_path(tmp_path) -> None:

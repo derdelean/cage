@@ -10,10 +10,10 @@ Backend selection:
   Python — ChaCha20 (no AEAD, no real zeroize) — development fallback
 
 All token lifecycle, revocation, and audit logic is delegated to the Gate —
-those operations handle no secret bytes. The ONLY path to a secret value is
-through ``consume()`` (deprecated) or ``invoke_llm()`` (preferred); both
-authorize against the Gate, record a use, append to the audit chain, and — for
-``invoke_llm()`` — keep the decrypted key inside Rust (never crossing PyO3).
+those operations handle no secret bytes. No ``SecretVault`` method returns a
+stored secret. The only uses of one are ``invoke_llm()`` and ``sign()``, and both authorize against
+the Gate, record a use, append to the audit chain, and keep the decrypted key
+inside Rust (never crossing PyO3).
 """
 
 from __future__ import annotations
@@ -44,18 +44,6 @@ def _require_bool(name: str, value: object) -> bool:
         )
     return value
 
-
-def _warn_plaintext_consume() -> None:
-    # Emitted only when plaintext is actually about to be handed back — a refused
-    # consume() must surface as CageViolation, never as this warning.
-    warnings.warn(
-        "vault.consume() returns a Python str — bytes cross PyO3 and "
-        "persist in CPython's interned-string heap. Prefer "
-        "vault.invoke_llm() for the Anthropic path. Per-provider Rust "
-        "transports replace consume() incrementally.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
 
 logger = logging.getLogger("cage.vault")
 
@@ -214,9 +202,9 @@ class SecretVault:
       Rust   — ChaCha20Poly1305 AEAD + zeroize-on-drop + mlock + rustls transport
       Python — ChaCha20 (no AEAD, no real zeroize) — development fallback
 
-    The ONLY path to a secret value is consume() (deprecated) or invoke_llm()
-    (preferred), which authorize via the Gate, record a use, append to the audit
-    chain, and — for invoke_llm() — keep the decrypted key inside Rust.
+    No method of this class returns a stored secret. The only uses of one are
+    invoke_llm() and sign(), which authorize via the Gate, record a use, append
+    to the audit chain, and keep the decrypted key inside Rust.
     """
 
     def __init__(
@@ -227,7 +215,6 @@ class SecretVault:
         insecure_dev_mode: bool = False,
         strict_backend: bool = False,
         broker_only_issuance: bool = False,
-        allow_plaintext_consume: bool = False,
     ) -> None:
         """
         Parameters
@@ -264,13 +251,6 @@ class SecretVault:
             authority out of the application process entirely, rather than relying
             on an in-process bootstrap. Token-gated *use* (``invoke_llm``) is
             unaffected — only issuance/revocation move to the broker.
-        allow_plaintext_consume : bool
-            If True, re-enables the deprecated ``consume()`` path, which returns
-            the secret as a Python ``str``. Development ONLY; the default is False
-            and a vault left at the default refuses ``consume()`` structurally.
-            This is a switch of its own — **not** a facet of ``insecure_dev_mode``
-            — so a caller who still needs the leak for a scope with no non-leaking
-            operation does not have to waive control-plane auth to get it.
         """
         # Broker-only issuance: disables the in-process control plane so the
         # operator authority never lives in the application process. Opt in via the
@@ -280,19 +260,12 @@ class SecretVault:
             in ("1", "true", "yes", "on")
         )
 
-        # Both loosening switches are typed strictly, never coerced — see
-        # _require_bool. consume() is refused by default; on the Rust backend the
-        # core enforces that, and this flag is consulted only on the pure-Python
-        # fallback, where it is the sole enforcement point.
+        # The loosening switch is typed strictly, never coerced (see _require_bool).
         insecure_dev_mode = _require_bool("insecure_dev_mode", insecure_dev_mode)
-        self._allow_plaintext_consume = _require_bool(
-            "allow_plaintext_consume", allow_plaintext_consume
-        )
 
         if _RUST_BACKEND_AVAILABLE:
             self._backend: _PythonVaultBackend | _RustBackend = _RustBackend(  # type: ignore[valid-type]
                 insecure_dev_mode=insecure_dev_mode,
-                allow_plaintext_consume=allow_plaintext_consume,
             )
             self._backend_name = "rust"
         else:
@@ -635,78 +608,48 @@ class SecretVault:
     # Secret access — token-gated
     # ------------------------------------------------------------------
 
-    def consume(self, token: CapabilityToken, scope: str) -> str:
+    def sign(self, token: CapabilityToken, payload: bytes | str) -> str:
         """
-        DEPRECATED and **dev-only** — use `invoke_llm()` instead for LLM
-        provider calls.
+        Token-gated HMAC-SHA256 over ``payload`` with the credential the token's
+        scope resolves to. Returns the hex signature. The key never leaves Rust.
 
-        Returns the cleartext secret as a Python `str`, which means the
-        bytes cross the Rust/Python boundary and persist in CPython's
-        interned-string heap. This is the plaintext-str leak that the
-        CAGE design forbids on critical paths, so it is **refused by
-        default** — it runs only when the vault was constructed with
-        ``allow_plaintext_consume=True``.
+        The token's scope must be in the ``sign`` namespace (``sign.<anything>``),
+        and that namespace must be registered to a stored secret with
+        ``register_scope_secret``. Authorize, charge and sign are one operation in
+        the Rust gate, audited as ``signed``. A ``str`` payload is signed as its
+        UTF-8 bytes.
 
-        Kept available (behind that opt-in) for non-LLM scopes and for
-        non-Anthropic providers until per-provider Rust transport adapters land;
-        in production such scopes have no ``consume`` path and are unsupported
-        until a non-leaking operation exists for them. Callers MUST pass the
-        return value inline and MUST NOT assign to a variable.
+        Holds only on the Rust backend. The pure-Python fallback would have to
+        read the key into a Python ``str`` to sign, so it refuses, as
+        ``invoke_llm`` does.
         """
-        if self._backend_name == "rust":
-            # The core is the enforcement point: it authorizes, then refuses (and
-            # audits) unless the gate was constructed with
-            # allow_plaintext_consume=True; when it is on, authorize + charge +
-            # audit + retrieve are one operation co-located with the secret. The
-            # plaintext str still crosses PyO3 (the deprecated leak), but it is
-            # never reachable as an *un*gated bypass.
-            try:
-                value = self._backend.consume(token.token_id, scope)
-            except ValueError as exc:
-                _raise_mapped(exc)
-            _warn_plaintext_consume()
-            return value
-
-        # Python fallback (dev only).
-        # Structural refusal (Invariant 6): authorize against the gate's own
-        # record, never the caller-supplied object's fields.
-        canonical = self._gate.authorize(token, scope)
-
-        if not self._allow_plaintext_consume:
-            # The only enforcement point on the fallback (its backend store is
-            # ungated by design). Audited like every other refusal, tagged with the
-            # writing layer because it arrives through the generic append channel.
+        if self._backend_name != "rust":
+            # Structural refusal first (Invariant 6), so a forged id is recorded as
+            # unknown by the gate. Then the refusal itself goes on the chain, keyed
+            # on the validated token, like every other refusal (Invariant 4).
+            canonical = self._gate.authorize(token)
             self._gate.append_audit(
-                canonical.token_id,
-                "consume_refused_plaintext_disabled",
-                {"scope": scope, "layer": "facade"},
+                canonical.token_id, "sign_refused_no_rust_backend", {"layer": "facade"}
             )
             raise CageViolation(
-                "vault.consume() is refused — it returns a Python str, leaking "
-                "plaintext into CPython's heap. Use invoke_llm() for LLM scopes "
-                "(the key never crosses PyO3) or the out-of-process broker "
-                "(BrokerClient.sign() for signing scopes; the cage.adapters "
-                "drop-ins for LLM calls); a scope with neither is not "
-                "production-supported yet."
+                "sign() requires the Rust backend, where the key stays inside the "
+                "gate. The pure-Python fallback would read it into a Python str, "
+                "so it refuses. Build the cage native extension "
+                "(maturin develop --release)."
             )
-
-        secret_key = self._gate.scope_to_secret(scope)
-        if not self._backend.has_secret(secret_key):
-            raise CageViolation(
-                f"No secret loaded for scope={scope!r} "
-                f"(expected stored name {secret_key!r})."
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        elif not isinstance(payload, (bytes, bytearray, memoryview)):
+            # bytes(5) would sign five zero bytes. Refuse anything that is not
+            # a byte sequence or text.
+            raise TypeError(
+                f"payload must be bytes or str, got {type(payload).__name__}"
             )
-
-        # Increment cumulative use counter — Invariant 3
-        canonical = self._gate.record_use(canonical)
-
-        self._gate.append_audit(
-            canonical.token_id, "consumed",
-            {"scope": scope, "use_count": canonical.use_count},
-        )
-
-        _warn_plaintext_consume()
-        return self._backend.retrieve_secret(secret_key)
+        try:
+            signature = self._backend.sign(token.token_id, bytes(payload))
+        except ValueError as exc:
+            _raise_mapped(exc)
+        return signature
 
     async def invoke_llm(
         self,
@@ -715,7 +658,7 @@ class SecretVault:
         provider: str = "anthropic",
     ) -> dict[str, Any]:
         """
-        Token-gated LLM invocation — replaces `consume()` for LLM provider calls.
+        Token-gated LLM invocation.
 
         Authorizes the token, increments use_count, appends an audit entry,
         then delegates to the provider's transport which performs the HTTPS
@@ -747,10 +690,14 @@ class SecretVault:
         # decrypted key never crosses PyO3, which holds ONLY on the Rust backend.
         # The pure-Python fallback would inject the key as a Python str — the exact
         # north-star violation this method exists to prevent — so refuse rather than
-        # silently leak. The fallback is not a production backend: consume() is
-        # dev-only there too, behind allow_plaintext_consume, and its in-process
+        # silently leak. The fallback is not a production backend: its in-process
         # store is ungated by design (strict_backend=True refuses the fallback).
         if self._backend_name != "rust":
+            # Same shape as sign(): validate the token, record the refusal, refuse.
+            canonical = self._gate.authorize(token)
+            self._gate.append_audit(
+                canonical.token_id, "invoke_refused_no_rust_backend", {"layer": "facade"}
+            )
             raise CageViolation(
                 "invoke_llm() requires the Rust backend for its zero-plaintext "
                 "guarantee (the decrypted key never crosses PyO3). The pure-Python "
