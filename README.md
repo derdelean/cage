@@ -54,6 +54,9 @@ The secret-custody and LLM transport ring loads only when you reach for it. LLM 
 from cage import vault
 
 vault.store_secret("llm_api_key", api_key)  # encrypts into Rust-owned memory
+# store_secret takes the key as a Python str. With the native extension,
+# vault.load_from_env_file(path, ["llm_api_key"]) reads it from a .env-format
+# file inside Rust, so the key never becomes a Python object.
 
 # Fail-closed by default: unseal once for the bootstrap (the authority root),
 # then pass it to every issue_token / revoke. On the Rust backend unseal()
@@ -168,6 +171,14 @@ cage-ai = { path = "../cage" }
 ```
 
 Locally built wheels are not signed.
+
+## Paper
+
+The design, the threat model, the security argument and the residual risks are described in the paper:
+
+Dennis Erdelean. *Caging Action, Not Speech: Capability-Gated Credential Containment for Autonomous Agents.* Zenodo, 2026. [doi.org/10.5281/zenodo.24143405](https://doi.org/10.5281/zenodo.24143405)
+
+The DOI resolves to the newest version of the paper. The first version describes release 0.1.5.
 
 ## License and patents
 
