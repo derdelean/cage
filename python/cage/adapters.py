@@ -23,8 +23,9 @@ one and pass a scoped token; the call sites stay the same.
         text = resp["content"][0]["text"]
 
 An adapter is constructed from only a broker and a token — never an API key — so
-it cannot reintroduce the key into this process. ``create(**body)`` forwards the
-keyword arguments to the provider byte-for-byte and returns the provider's native
+it cannot reintroduce the key into this process. ``create(**body)`` sends the
+keyword arguments to the provider as a JSON body (the broker re-serializes it, so
+key order and whitespace may differ) and returns the provider's native
 JSON response (a ``dict``), not a typed SDK object: read ``resp["content"]`` /
 ``resp["choices"]`` rather than ``resp.content`` / ``resp.choices``.
 

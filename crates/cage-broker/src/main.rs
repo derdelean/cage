@@ -107,7 +107,8 @@ fn main() {
             let path = path.to_string_lossy().into_owned();
             // `signing_key` is required; `llm_api_key` is optional — load whichever
             // the sealed file provides, so one broker can both sign and serve LLM
-            // calls. Names absent from the file are simply not loaded.
+            // calls. Names absent from the file are simply not loaded. A name that
+            // is present with an empty value refuses the whole file.
             gate.load_credentials_from_env(
                 &path,
                 &["signing_key".to_string(), "llm_api_key".to_string()],

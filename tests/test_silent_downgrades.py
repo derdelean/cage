@@ -3,7 +3,8 @@ Regression tests for pentest findings #7, #13, #10 — the shipped Python surfac
 longer silently downgrades:
   #13 invoke_llm fails closed off the Rust backend instead of leaking the key.
   #7  audit_chain_signed marks the unsigned fallback; strict_backend fails closed.
-  #10 unseal() warns that the bootstrap crosses PyO3 as an un-zeroable str.
+  #10 unseal() returns an opaque handle on the Rust backend, so the bootstrap
+      never crosses PyO3 as a str (only the pure-Python fallback still warns).
   2026-11-09: sign() fails closed off the Rust backend, as invoke_llm does.
 """
 

@@ -182,7 +182,7 @@ def agent_worker(sock_path: str) -> int:
     """The AGENT — runs in its OWN process.
 
     Receives only the token_ids it may use, on stdin. It never holds the
-    bootstrap token and never binds the signing key. It prints its narrative to
+    operator key and never binds the signing key. It prints its narrative to
     stderr (inherited, so it shows live) and reports every response byte it
     received back to the parent on stdout, so the leak check runs OUTSIDE this
     process — the agent never even holds the secret to compare against.
@@ -260,10 +260,10 @@ def main() -> int:
         print("Attestation pubkey:", pubkey[:32] + "...")
         print("=" * 72)
 
-        # -- CONTROL PLANE (has the bootstrap token) ------------------------
+        # -- CONTROL PLANE (holds the operator key) -------------------------
         # Issue every token the agent will hold up front. The 1-second token is
         # left to expire and one token is revoked — both before the agent process
-        # starts, so the agent only ever receives token_ids, never the bootstrap.
+        # starts, so the agent only ever receives token_ids, never the operator key.
         print("\n[CONTROL PLANE]  holds the operator key; issues capability tokens (agent gets only token_ids):")
         main_t = broker.issue_token(
             scope="sign.invoice", context="run-42", ttl_seconds=60, max_uses=2,

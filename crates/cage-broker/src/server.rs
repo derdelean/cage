@@ -49,13 +49,15 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 
 /// Bind `socket_path` and serve until the listener errors. Prints a
 /// `CAGE_BROKER_READY=<path>` line on stdout once bound, so a supervisor can
-/// wait for readiness.
+/// wait for readiness. Call it before the process starts any other thread: the
+/// bind changes the process umask for a moment.
 pub fn serve_unix(gate: Gate, socket_path: &str) -> std::io::Result<()> {
     // Start from a clean socket path.
     let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = bind_private(socket_path)?;
     // Restrict the socket to the broker UID (0600): a different-UID co-tenant cannot
-    // connect even before the per-accept peer-credential check below.
+    // connect even before the per-accept peer-credential check below. The socket is
+    // already created 0600 by `bind_private`, this pins the mode explicitly.
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
@@ -195,20 +197,53 @@ fn serve_invoke(gate: &Arc<Mutex<Gate>>, token_id: &str, provider: &str, body: &
     }
 }
 
+/// Bind `socket_path` so the socket is created with mode 0600, whatever umask the
+/// broker was started under. Under a permissive umask (002 or 000) the socket was
+/// connectable by other users until the chmod that follows. The peer-UID check
+/// refused them even then, so this is defense in depth. The umask is process-wide:
+/// call this only while no other thread exists.
+fn bind_private(socket_path: &str) -> std::io::Result<UnixListener> {
+    let previous = unsafe { libc::umask(0o177) };
+    let listener = UnixListener::bind(socket_path);
+    unsafe { libc::umask(previous) };
+    listener
+}
+
 /// Peer UIDs allowed to connect: the broker's own euid, plus any in the
 /// `CAGE_BROKER_ALLOWED_UIDS` (comma-separated) allowlist for a differently-UID'd
-/// agent.
+/// agent. An entry that is not a UID is not allowed in, and is reported on stderr
+/// so a typo does not pass unnoticed.
 fn allowed_uids() -> HashSet<u32> {
     let mut set = HashSet::new();
     set.insert(unsafe { libc::geteuid() });
     if let Some(list) = std::env::var_os("CAGE_BROKER_ALLOWED_UIDS") {
-        for part in list.to_string_lossy().split(',') {
-            if let Ok(uid) = part.trim().parse::<u32>() {
-                set.insert(uid);
-            }
+        let (uids, rejected) = parse_uid_list(&list.to_string_lossy());
+        set.extend(uids);
+        for entry in rejected {
+            eprintln!(
+                "[cage-broker] WARNING: ignoring CAGE_BROKER_ALLOWED_UIDS entry {entry:?}: not a numeric UID"
+            );
         }
     }
     set
+}
+
+/// Split a comma-separated UID list into the UIDs and the entries that are not
+/// one. Empty entries (a trailing comma) are neither.
+fn parse_uid_list(list: &str) -> (Vec<u32>, Vec<String>) {
+    let mut uids = Vec::new();
+    let mut rejected = Vec::new();
+    for part in list.split(',') {
+        let entry = part.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.parse::<u32>() {
+            Ok(uid) => uids.push(uid),
+            Err(_) => rejected.push(entry.to_string()),
+        }
+    }
+    (uids, rejected)
 }
 
 /// The connected peer's UID. `None` if it cannot be determined — treated as not
@@ -254,4 +289,35 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 
 fn peer_allowed(stream: &UnixStream, allowed: &HashSet<u32>) -> bool {
     matches!(peer_uid(stream), Some(uid) if allowed.contains(&uid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_is_created_private_under_an_open_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // `create_dir` fails if the name exists, so nobody else prepared it.
+        let dir = std::env::temp_dir().join(format!("cage-sock-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("b.sock");
+        // The umask is process-wide and tests share the process. No other test
+        // in this crate creates a file, so opening it up for one bind is safe.
+        let before = unsafe { libc::umask(0) };
+        let listener = bind_private(path.to_str().unwrap());
+        let after = unsafe { libc::umask(before) };
+        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
+        std::fs::remove_dir_all(&dir).unwrap();
+        listener.unwrap();
+        assert_eq!(mode.unwrap(), 0o600);
+        assert_eq!(after, 0, "bind_private must restore the umask it found");
+    }
+
+    #[test]
+    fn uid_list_reports_entries_that_are_not_uids() {
+        let (uids, rejected) = parse_uid_list("1000, 1001,abc,-1, ,10o1,");
+        assert_eq!(uids, vec![1000, 1001]);
+        assert_eq!(rejected, vec!["abc", "-1", "10o1"]);
+    }
 }

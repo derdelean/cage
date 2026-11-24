@@ -94,7 +94,11 @@ impl RustGate {
         self.lock().store_secret(name, value).map_err(to_py)
     }
 
-    pub fn load_from_env_file(&self, path: &str, secret_names: Vec<String>) -> PyResult<usize> {
+    pub fn load_from_env_file(
+        &self,
+        path: &str,
+        secret_names: Vec<String>,
+    ) -> PyResult<Vec<String>> {
         self.lock()
             .load_credentials_from_env(path, &secret_names)
             .map_err(to_py)

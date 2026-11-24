@@ -427,3 +427,40 @@ def test_policy_waiver_is_recorded_on_the_audit_chain(monkeypatch):
         events = _audit_events(bp)
     assert "issuance_policy_frozen" in events
     assert "issuance_policy_waived" not in events
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"signing_key": ""},
+        {"signing_key": " sk-test"},
+        {"signing_key": "sk-test\t"},
+        {"signing_key": '"sk-test"'},
+        {"signing_key": "'sk-test'"},
+        {"signing_key": "sk\ntest"},
+        {"signing_key": b"sk-test"},
+        {"signing_key": "sk-test\udcff"},
+        {"signing_key": "sk-test", "llm_api_key": "sk-llm\r"},
+        {"signing_key": "sk-test", "llm_api_key": ""},
+    ],
+)
+def test_spawn_broker_refuses_a_key_the_broker_would_read_altered(
+    kwargs, tmp_path, monkeypatch
+) -> None:
+    # Refused in the constructor: no temp dir, no file, no process. The message
+    # must not echo the key.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with pytest.raises(CageViolation) as excinfo:
+        with spawn_broker("/nonexistent/cage-broker", **kwargs):
+            pass
+    assert "sk" not in str(excinfo.value)
+    assert os.listdir(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "key", ["\"abc'", "#abc", "a=b", "a b", "k\x1f", '"', "sk-äöü"]
+)
+def test_keys_the_broker_reads_unaltered_are_not_refused(key) -> None:
+    from cage.broker import _refuse_key_the_broker_would_alter
+
+    _refuse_key_the_broker_would_alter("signing_key", key)
