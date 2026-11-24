@@ -434,23 +434,53 @@ impl Vault {
 
     /// Load secrets from a `.env`-format file directly into vault memory. The
     /// plaintext values never leave a `Zeroizing<Vec<u8>>` inside this method.
-    /// Returns the count loaded.
+    /// Returns the names it stored, in file order. A name already in the vault
+    /// is overwritten and is in the list. The whole file is checked for a
+    /// repeated name and for a line that is not valid UTF-8 before anything is
+    /// stored, so a file refused for either leaves the vault as it was. Comment
+    /// lines are skipped before decoding. Any other undecodable line refuses the
+    /// file, also one for a name outside `secret_names`. A leading UTF-8
+    /// byte-order mark is ignored. Lines end at a line feed, and a carriage
+    /// return anywhere but the end of a line refuses the file, so a file with
+    /// bare carriage-return line endings is not read as one long value. An
+    /// empty value for a name in `secret_names` refuses the file too.
     pub fn load_from_env_file(
         &mut self,
         path: &str,
         secret_names: Vec<String>,
-    ) -> Result<usize, CageError> {
+    ) -> Result<Vec<String>, CageError> {
         let raw_bytes = std::fs::read(path)
             .map_err(|e| CageError::Io(format!("cannot read env file {path:?}: {e}")))?;
         let raw_bytes = Zeroizing::new(raw_bytes);
 
-        let mut loaded = 0usize;
+        // Borrowed from `raw_bytes`, so no value is copied before it is stored.
+        let mut entries: Vec<(&str, &str)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for line_bytes in raw_bytes.split(|&b| b == b'\n') {
+        let content = raw_bytes
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(raw_bytes.as_slice());
+
+        for (index, line_bytes) in content.split(|&b| b == b'\n').enumerate() {
+            if line_bytes.trim_ascii_end().contains(&b'\r') {
+                return Err(CageError::EnvLineRefused {
+                    path: path.to_string(),
+                    line: index + 1,
+                    kind: "carriage_return",
+                });
+            }
+            if line_bytes.trim_ascii_start().starts_with(b"#") {
+                continue;
+            }
+            // Skipping an undecodable line would drop a secret without an error.
             let line = match std::str::from_utf8(line_bytes) {
                 Ok(s) => s.trim(),
-                Err(_) => continue,
+                Err(_) => {
+                    return Err(CageError::EnvNotUtf8 {
+                        path: path.to_string(),
+                        line: index + 1,
+                    })
+                }
             };
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -480,10 +510,22 @@ impl Vault {
                     path: path.to_string(),
                 });
             }
+            if val.is_empty() {
+                return Err(CageError::EnvLineRefused {
+                    path: path.to_string(),
+                    line: index + 1,
+                    kind: "empty_value",
+                });
+            }
 
+            entries.push((key, val));
+        }
+
+        let mut loaded = Vec::with_capacity(entries.len());
+        for (key, val) in entries {
             let plaintext_bytes = Zeroizing::new(val.as_bytes().to_vec());
             self.encrypt_and_store(key.to_string(), plaintext_bytes.as_slice())?;
-            loaded += 1;
+            loaded.push(key.to_string());
         }
 
         Ok(loaded)
@@ -1000,5 +1042,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn env_load_returns_the_names_it_stored_in_file_order() {
+        let path = write_env("order", b"BETA=b\n# comment\nOTHER=x\nALPHA=a\n");
+        let mut v = Vault::new();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string(), "GAMMA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            loaded.unwrap(),
+            vec!["BETA".to_string(), "ALPHA".to_string()]
+        );
+        assert!(v.has_secret("ALPHA") && v.has_secret("BETA"));
+        assert!(!v.has_secret("GAMMA") && !v.has_secret("OTHER"));
+    }
+
+    fn write_env(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cage-vault-env-{tag}-{}-{:?}.env",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn env_load_ignores_a_leading_byte_order_mark() {
+        let path = write_env("bom", b"\xEF\xBB\xBFALPHA=a\nBETA=b\n");
+        let mut v = Vault::new();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.unwrap().len(), 2);
+        assert_eq!(v.decrypt_secret("ALPHA").unwrap().as_slice(), b"a");
+    }
+
+    #[test]
+    fn env_load_refuses_a_line_that_is_not_utf8_and_stores_nothing() {
+        let path = write_env("utf8", b"ALPHA=a\nBETA=b\xff\n");
+        let mut v = Vault::new();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(loaded, Err(CageError::EnvNotUtf8 { line: 2, .. })));
+        assert!(!v.has_secret("ALPHA") && !v.has_secret("BETA"));
+    }
+
+    /// (kind and line of the refusal, whether anything was stored)
+    fn refused_kind(bytes: &[u8]) -> (Option<(&'static str, usize)>, bool) {
+        let path = write_env("strict", bytes);
+        let mut v = Vault::new();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        let kind = match loaded {
+            Err(CageError::EnvLineRefused { kind, line, .. }) => Some((kind, line)),
+            _ => None,
+        };
+        (kind, v.has_secret("ALPHA") || v.has_secret("BETA"))
+    }
+
+    #[test]
+    fn env_load_refuses_carriage_return_line_endings() {
+        assert_eq!(
+            refused_kind(b"ALPHA=a\rBETA=b\r"),
+            (Some(("carriage_return", 1)), false)
+        );
+        // Also when the line starts as a comment, which is skipped otherwise.
+        assert_eq!(
+            refused_kind(b"ALPHA=a\n# note\rBETA=b\r"),
+            (Some(("carriage_return", 2)), false)
+        );
+    }
+
+    #[test]
+    fn env_load_accepts_crlf_line_endings() {
+        let path = write_env("crlf", b"ALPHA=a\r\nBETA=b\r\n");
+        let mut v = Vault::new();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.unwrap().len(), 2);
+        assert_eq!(v.decrypt_secret("ALPHA").unwrap().as_slice(), b"a");
+    }
+
+    #[test]
+    fn env_load_refuses_an_empty_value_for_a_whitelisted_name() {
+        assert_eq!(
+            refused_kind(b"ALPHA=a\nBETA=\n"),
+            (Some(("empty_value", 2)), false)
+        );
+        assert_eq!(
+            refused_kind(b"BETA=\"\"\n"),
+            (Some(("empty_value", 1)), false)
+        );
+    }
+
+    #[test]
+    fn env_load_ignores_an_empty_value_outside_the_whitelist() {
+        assert_eq!(refused_kind(b"OTHER=\nALPHA=a\n"), (None, true));
+    }
+
+    #[test]
+    fn env_load_skips_a_comment_that_is_not_utf8() {
+        let path = write_env("comment", b"# Schl\xfcssel\nALPHA=a\n");
+        let mut v = Vault::new();
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), vec!["ALPHA".to_string()]);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.unwrap(), vec!["ALPHA".to_string()]);
+    }
+
+    #[test]
+    fn env_load_with_a_repeated_name_stores_nothing() {
+        let path = write_env("dup", b"ALPHA=new\nBETA=b\nALPHA=x\n");
+        let mut v = Vault::new();
+        v.store_secret("ALPHA".into(), "old".into()).unwrap();
+        let names = vec!["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = v.load_from_env_file(path.to_str().unwrap(), names);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(loaded, Err(CageError::DuplicateEnvKey { .. })));
+        assert!(!v.has_secret("BETA"));
+        assert_eq!(v.decrypt_secret("ALPHA").unwrap().as_slice(), b"old");
     }
 }

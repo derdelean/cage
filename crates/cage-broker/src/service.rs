@@ -74,7 +74,7 @@ pub fn handle(gate: &mut Gate, req: Request) -> Response {
 
         Request::VerifyChain => Ok(json!({ "valid": gate.verify_audit_chain() })),
 
-        // Bootstrap-gated: it signs with the audit key, so it must not be an open
+        // Operator-signature gated: it signs with the audit key, so it must not be an open
         // signing oracle.
         Request::Attest { auth } => {
             if !gate.authorize_control("attest", core_auth(&auth)) {
@@ -87,7 +87,7 @@ pub fn handle(gate: &mut Gate, req: Request) -> Response {
             }
         }
 
-        // Bootstrap-gated: entries carry entity_id (= live token_id), a bearer
+        // Operator-signature gated: entries carry entity_id (= live token_id), a bearer
         // handle that must not leak on an unauthenticated channel.
         Request::AuditLog { auth } => {
             if !gate.authorize_control("audit_log", core_auth(&auth)) {
@@ -129,7 +129,14 @@ pub(crate) fn error_kind(e: &CageError) -> &'static str {
         CageError::NotFound(_) => "not_found",
         CageError::Transport(_) => "transport",
         CageError::Crypto(_) => "crypto",
-        _ => "error",
+        // Listed, not a wildcard: a new core error must be given a kind here.
+        CageError::AlreadyUnsealed
+        | CageError::BadAuditData(_)
+        | CageError::DuplicateEnvKey { .. }
+        | CageError::EnvNotUtf8 { .. }
+        | CageError::EnvLineRefused { .. }
+        | CageError::Io(_)
+        | CageError::Serialize(_) => "error",
     }
 }
 

@@ -61,6 +61,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from cage._envfile import _RUST_WHITESPACE
 from cage.exceptions import CageViolation
 from cage.token import CapabilityToken
 
@@ -264,8 +265,10 @@ class BrokerClient:
         """Invoke an LLM provider with the token's scoped key.
 
         The key never crosses the socket: the broker decrypts it, makes the TLS
-        call, and returns only the provider's response. ``request_body`` is
-        forwarded to the provider byte-for-byte. Returns the provider's JSON
+        call, and returns only the provider's response. The broker parses
+        ``request_body`` and re-serializes it, so the provider receives an
+        equivalent JSON body whose bytes may differ (key order, whitespace).
+        Returns the provider's JSON
         response parsed into a ``dict``, as ``SecretVault.invoke_llm`` does.
         """
         result = self._request(
@@ -365,6 +368,29 @@ class BrokerClient:
 # file, and tear it all down on exit.
 
 
+def _refuse_key_the_broker_would_alter(arg: str, key: object) -> None:
+    """Refuse a credential that the broker's env-file loader would change.
+
+    The loader ends a line at a line break, trims the value and strips one pair
+    of wrapping quotes. The message names the argument, never the key.
+    """
+    if not isinstance(key, str):
+        raise CageViolation(f"{arg} must be a str, got {type(key).__name__}")
+    has_line_break = "\n" in key or "\r" in key
+    is_trimmed = key != key.strip(_RUST_WHITESPACE)
+    is_quoted = len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'"
+    try:
+        key.encode("utf-8")
+        encodable = True
+    except UnicodeEncodeError:
+        encodable = False
+    if not key or has_line_break or is_trimmed or is_quoted or not encodable:
+        raise CageViolation(
+            f"{arg} is empty, has surrounding whitespace or quotes, contains a "
+            "line break or is not valid Unicode. It would reach the broker altered."
+        )
+
+
 class BrokerProcess:
     """A running ``cage-broker`` child process, used as a context manager.
 
@@ -430,6 +456,10 @@ class BrokerProcess:
                     'Refusing to coerce: a truthy string such as "false" would '
                     "otherwise switch off a broker safeguard."
                 )
+        # Before anything is created, so a refused key leaves nothing behind.
+        _refuse_key_the_broker_would_alter("signing_key", signing_key)
+        if llm_api_key is not None:
+            _refuse_key_the_broker_would_alter("llm_api_key", llm_api_key)
         self.allow_debugger = allow_debugger
         self.allow_no_policy = allow_no_policy
         self.broker_bin = broker_bin
@@ -488,7 +518,7 @@ class BrokerProcess:
         try:
             # O_EXCL: always a fresh file, never a symlink or FIFO planted at this path.
             fd = os.open(cred, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(f"signing_key={self._signing_key}\n")
                 if self._llm_api_key is not None:
                     f.write(f"llm_api_key={self._llm_api_key}\n")

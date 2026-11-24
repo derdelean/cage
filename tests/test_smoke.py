@@ -635,3 +635,225 @@ def test_load_from_env_file_emits_audit_entries(tmp_path) -> None:
     names = {e["data"]["name"] for e in loaded_entries}
     assert names == {"ALPHA", "BETA"}
     assert v.audit_chain_valid()
+
+
+def test_load_from_env_file_audits_only_names_in_the_file(tmp_path) -> None:
+    # A whitelisted name that was stored earlier and is absent from the file
+    # was not loaded from env, so it must not get a loaded_from_env entry.
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA=a\n")
+    v = SecretVault(insecure_dev_mode=True)
+    v.store_secret("GAMMA", "stored-earlier")
+    loaded = v.load_from_env_file(str(env_file), ["ALPHA", "GAMMA"])
+    assert loaded == 1
+    log = v.get_audit_log()
+    names = [e["data"]["name"] for e in log if e["event"] == "loaded_from_env"]
+    assert names == ["ALPHA"]
+
+
+def test_load_from_env_file_audits_an_overwrite(tmp_path) -> None:
+    # The file replacing an already-stored secret is a load from env and must
+    # stay on the chain.
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA=new\n")
+    v = SecretVault(insecure_dev_mode=True)
+    v.store_secret("ALPHA", "old")
+    v.load_from_env_file(str(env_file), ["ALPHA"])
+    log = v.get_audit_log()
+    names = [e["data"]["name"] for e in log if e["event"] == "loaded_from_env"]
+    assert names == ["ALPHA"]
+
+
+def _fallback_vault(monkeypatch) -> SecretVault:
+    import sys
+    import warnings
+
+    # `cage.vault` the attribute is the singleton, so take the module itself.
+    vault_module = sys.modules["cage.vault"]
+    monkeypatch.setattr(vault_module, "_RUST_BACKEND_AVAILABLE", False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        v = SecretVault(insecure_dev_mode=True)
+    assert v.backend == "python"
+    return v
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_refused_file_changes_nothing(
+    tmp_path, monkeypatch, backend
+) -> None:
+    # A repeated whitelisted name refuses the whole file. Nothing from it may
+    # be stored or overwritten, and the chain must not claim a load.
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA=canary-one-7f3a\nBETA=b\nALPHA=canary-two-9b1c\n")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    v.store_secret("ALPHA", "old")
+    events_before = [e["event"] for e in v.get_audit_log()]
+    with pytest.raises(ValueError):
+        v.load_from_env_file(str(env_file), ["ALPHA", "BETA"])
+    assert not v.has_secret("BETA")
+    events_after = [e["event"] for e in v.get_audit_log()]
+    assert events_after == events_before + ["credentials_load_refused"]
+    # Same structured entry on both backends, and no value in it.
+    assert v.get_audit_log()[-1]["data"] == {
+        "kind": "duplicate_name", "name": "ALPHA", "path": str(env_file),
+    }
+    if backend == "python":
+        assert v._backend.retrieve_secret("ALPHA") == "old"
+    elif v.backend == "rust":
+        # No call returns a secret, so prove ALPHA is unchanged by signing with it.
+        v.register_scope_secret("sign.", "ALPHA")
+        token = v.issue_token(scope="sign.check", context="t", max_uses=1)
+        expected = hmac.new(b"old", b"msg", hashlib.sha256).hexdigest()
+        assert v.sign(token, b"msg") == expected
+
+
+def test_load_from_env_file_audits_only_file_names_on_the_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPHA=a\n")
+    v = _fallback_vault(monkeypatch)
+    v.store_secret("GAMMA", "stored-earlier")
+    assert v.load_from_env_file(str(env_file), ["ALPHA", "GAMMA"]) == 1
+    names = [
+        e["data"]["name"] for e in v.get_audit_log() if e["event"] == "loaded_from_env"
+    ]
+    assert names == ["ALPHA"]
+
+
+def test_credentials_loaded_entry_names_what_was_loaded(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("BETA=b\nALPHA=a\n")
+    v = SecretVault(insecure_dev_mode=True)
+    if v.backend != "rust":
+        pytest.skip("credentials_loaded is written by the Rust core")
+    v.load_from_env_file(str(env_file), ["ALPHA", "BETA"])
+    entries = [e for e in v.get_audit_log() if e["event"] == "credentials_loaded"]
+    assert len(entries) == 1
+    # Sorted, so the entry does not depend on the line order of the file.
+    assert entries[0]["data"] == {"count": 2, "names": ["ALPHA", "BETA"]}
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_ignores_a_byte_order_mark(
+    tmp_path, monkeypatch, backend
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"\xef\xbb\xbfALPHA=a\nBETA=b\n")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    assert v.load_from_env_file(str(env_file), ["ALPHA", "BETA"]) == 2
+    assert v.has_secret("ALPHA") and v.has_secret("BETA")
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_refuses_invalid_utf8(tmp_path, monkeypatch, backend) -> None:
+    # Skipping the bad line would drop BETA with only a lower count to show for it.
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"ALPHA=a\nBETA=b\xff\n")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    with pytest.raises(ValueError):
+        v.load_from_env_file(str(env_file), ["ALPHA", "BETA"])
+    assert not v.has_secret("ALPHA") and not v.has_secret("BETA")
+    refusals = [
+        e["data"] for e in v.get_audit_log() if e["event"] == "credentials_load_refused"
+    ]
+    assert refusals == [{"kind": "not_utf8", "line": 2, "path": str(env_file)}]
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_audits_an_unreadable_file(
+    tmp_path, monkeypatch, backend
+) -> None:
+    missing = str(tmp_path / "does-not-exist.env")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    with pytest.raises(ValueError):
+        v.load_from_env_file(missing, ["ALPHA"])
+    assert v.get_audit_log()[-1]["event"] == "credentials_load_refused"
+    assert v.get_audit_log()[-1]["data"] == {"kind": "unreadable", "path": missing}
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_skips_a_comment_that_is_not_utf8(
+    tmp_path, monkeypatch, backend
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"# Schl\xfcssel\nALPHA=a\n")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    assert v.load_from_env_file(str(env_file), ["ALPHA"]) == 1
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+@pytest.mark.parametrize(
+    "content, refusal",
+    [
+        (b"ALPHA=a\rBETA=b\r", {"kind": "carriage_return", "line": 1}),
+        (b"# note\rALPHA=a\r", {"kind": "carriage_return", "line": 1}),
+        (b"ALPHA=a\nBETA=\n", {"kind": "empty_value", "line": 2}),
+        (b'ALPHA=""\n', {"kind": "empty_value", "line": 1}),
+        (b"ALPHA=a\n# note\rBETA=b\r", {"kind": "carriage_return", "line": 2}),
+    ],
+)
+def test_load_from_env_file_refuses_a_line_it_would_misread(
+    tmp_path, monkeypatch, backend, content, refusal
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(content)
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    with pytest.raises(ValueError):
+        v.load_from_env_file(str(env_file), ["ALPHA", "BETA"])
+    assert not v.has_secret("ALPHA") and not v.has_secret("BETA")
+    assert v.get_audit_log()[-1]["event"] == "credentials_load_refused"
+    assert v.get_audit_log()[-1]["data"] == {**refusal, "path": str(env_file)}
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_accepts_crlf_and_a_lone_quote(
+    tmp_path, monkeypatch, backend
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b'ALPHA=a\r\nBETA="\r\n')
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    assert v.load_from_env_file(str(env_file), ["ALPHA", "BETA"]) == 2
+    if backend == "python":
+        assert v._backend.retrieve_secret("ALPHA") == "a"
+        assert v._backend.retrieve_secret("BETA") == '"'
+
+
+@pytest.mark.parametrize("backend", ["default", "python"])
+def test_load_from_env_file_keeps_a_separator_control_character(
+    tmp_path, monkeypatch, backend
+) -> None:
+    # Python's str.strip() would remove U+001F and turn this into an empty
+    # value. The Rust loader keeps it, so the fallback must too.
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"ALPHA=\x1f\n")
+    v = _fallback_vault(monkeypatch) if backend == "python" else SecretVault(
+        insecure_dev_mode=True
+    )
+    assert v.load_from_env_file(str(env_file), ["ALPHA"]) == 1
+    if backend == "python":
+        assert v._backend.retrieve_secret("ALPHA") == "\x1f"
+
+
+def test_load_from_env_file_rejects_a_str_whitelist(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("key=v\n")
+    v = SecretVault(insecure_dev_mode=True)
+    with pytest.raises(TypeError):
+        v.load_from_env_file(str(env_file), "signing_key")
+    assert not v.has_secret("key")

@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from cage.core import Gate
 from cage.core.gate import _raise_mapped
+from cage._envfile import _RUST_WHITESPACE
 from cage.exceptions import CageViolation
 from cage.token import CapabilityToken
 
@@ -439,6 +440,58 @@ class SecretVault:
             )
         logger.debug("cage_secret_stored name=%s backend=%s", name, self._backend_name)
 
+    @staticmethod
+    def _parse_env_file(
+        path: str, secret_names: list[str]
+    ) -> tuple[list[tuple[str, str]], Optional[dict]]:
+        """Parse an env file for the pure-Python fallback.
+
+        Returns ``(entries, None)`` or ``([], refusal)``. The refusal carries
+        the path, a name or a line number, never a value. No exception leaves
+        this function with file content attached.
+        """
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except (OSError, ValueError):  # ValueError: a NUL in the path
+            return [], {"kind": "unreadable", "path": path}
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for index, line_bytes in enumerate(raw.split(b"\n")):
+            if b"\r" in line_bytes.rstrip(b" \t\r\n\x0c"):
+                return [], {"kind": "carriage_return", "line": index + 1, "path": path}
+            # Same byte set as Rust's trim_ascii_start (no vertical tab).
+            if line_bytes.lstrip(b" \t\r\x0c").startswith(b"#"):
+                continue
+            try:
+                line = line_bytes.decode("utf-8").strip(_RUST_WHITESPACE)
+            except UnicodeDecodeError:
+                line = None
+            if line is None:
+                return [], {"kind": "not_utf8", "line": index + 1, "path": path}
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip(_RUST_WHITESPACE)
+            val = val.strip(_RUST_WHITESPACE)
+            # len >= 2: a lone quote is a value, as in the Rust loader.
+            if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif len(val) >= 2 and val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            if key not in secret_names:
+                continue
+            if key in seen:
+                return [], {"kind": "duplicate_name", "name": key, "path": path}
+            if not val:
+                return [], {"kind": "empty_value", "line": index + 1, "path": path}
+            seen.add(key)
+            entries.append((key, val))
+        return entries, None
+
     def load_from_env_file(
         self,
         path: str,
@@ -473,49 +526,67 @@ class SecretVault:
         Raises
         ------
         ValueError
-            If the file cannot be read, or if a whitelisted key appears
-            more than once in the file.
+            If the file cannot be read, if a whitelisted key appears more
+            than once or has an empty value, if a line other than a comment
+            is not valid UTF-8, or if a line holds a carriage return anywhere
+            but its end (bare carriage-return line endings).
+            The whole file is refused, nothing from it is stored, and the
+            refusal is recorded on the audit chain as
+            ``credentials_load_refused``.
+        TypeError
+            If ``secret_names`` is a single ``str`` or ``bytes``.
         """
+        if isinstance(secret_names, (str, bytes)):
+            # A str would turn the whitelist test below into a substring match.
+            raise TypeError("CAGE: secret_names must be a list of names, not a string")
+        secret_names = list(secret_names)
+
         if hasattr(self._backend, "load_from_env_file"):
-            loaded = self._backend.load_from_env_file(
-                str(path), list(secret_names)
+            loaded_names = list(
+                self._backend.load_from_env_file(str(path), secret_names)
             )
         else:
             # Python fallback — plaintext briefly as Python str (acknowledged).
-            from pathlib import Path as _Path
-
-            text = _Path(path).read_text()
-            loaded = 0
-            seen: set[str] = set()
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip()
-                if val.startswith('"') and val.endswith('"'):
-                    val = val[1:-1]
-                elif val.startswith("'") and val.endswith("'"):
-                    val = val[1:-1]
-                if key not in secret_names:
-                    continue
-                if key in seen:
-                    raise ValueError(
-                        f"CAGE: duplicate key {key!r} in env file {path!r}"
+            # Mirrors the Rust loader: split on "\n", skip comments before
+            # decoding, refuse the file on any other undecodable line.
+            entries, refusal = self._parse_env_file(str(path), secret_names)
+            if refusal is not None:
+                del entries
+                self._gate.append_audit("vault", "credentials_load_refused", refusal)
+                # Close to the Rust loader's wording. The audit entry is the
+                # part that is identical on both backends.
+                if refusal["kind"] == "duplicate_name":
+                    detail = f'duplicate key "{refusal["name"]}" in env file "{path}"'
+                elif refusal["kind"] == "not_utf8":
+                    detail = f'env file "{path}" line {refusal["line"]} is not valid UTF-8'
+                elif "line" in refusal:
+                    detail = (
+                        f'env file "{path}" line {refusal["line"]} refused: '
+                        f'{refusal["kind"]}'
                     )
-                seen.add(key)
+                else:
+                    detail = f'cannot read env file "{path}"'
+                raise ValueError(f"CAGE: {detail}")
+
+            # Store only after the whole file passed the duplicate check, so a
+            # file refused for a repeated name leaves the vault as it was.
+            loaded_names = []
+            while entries:
+                key, val = entries.pop(0)
                 self._backend.store_secret(key, val)
-                loaded += 1
+                loaded_names.append(key)
                 del val
 
-        for name in secret_names:
-            if self._backend.has_secret(name):
-                self._gate.append_audit(
-                    "vault", "loaded_from_env",
-                    {"name": name, "backend": self._backend_name},
-                )
+        # Audit only what this file stored, overwrites included. A whitelisted
+        # name that was already in the vault and is absent from the file was not
+        # loaded from env.
+        for name in loaded_names:
+            self._gate.append_audit(
+                "vault", "loaded_from_env",
+                {"name": name, "backend": self._backend_name},
+            )
 
+        loaded = len(loaded_names)
         logger.info(
             "cage_loaded_from_env path=%s loaded=%s backend=%s",
             str(path), loaded, self._backend_name,

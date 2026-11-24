@@ -408,19 +408,43 @@ impl Gate {
     }
 
     /// Load credentials from a `.env` file straight into vault memory (the
-    /// plaintext never leaves Rust). Returns the count loaded.
+    /// plaintext never leaves Rust). Returns the names loaded, in file order.
+    /// A refused file is recorded on the chain too.
     pub fn load_credentials_from_env(
         &mut self,
         path: &str,
         names: &[String],
-    ) -> Result<usize, CageError> {
-        let loaded = self.vault.load_from_env_file(path, names.to_vec())?;
-        // Audit the genesis credential-load event (broker startup), never the
-        // secret values — only the count.
+    ) -> Result<Vec<String>, CageError> {
+        let loaded = match self.vault.load_from_env_file(path, names.to_vec()) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                // Path, name and line number only. Never a value.
+                let data = match &e {
+                    CageError::DuplicateEnvKey { key, path } => {
+                        serde_json::json!({ "kind": "duplicate_name", "name": key, "path": path })
+                    }
+                    CageError::EnvNotUtf8 { path, line } => {
+                        serde_json::json!({ "kind": "not_utf8", "line": line, "path": path })
+                    }
+                    CageError::EnvLineRefused { path, line, kind } => {
+                        serde_json::json!({ "kind": kind, "line": line, "path": path })
+                    }
+                    CageError::Io(_) => serde_json::json!({ "kind": "unreadable", "path": path }),
+                    _ => serde_json::json!({ "kind": "error", "path": path }),
+                };
+                self.audit("vault", "credentials_load_refused", &data);
+                return Err(e);
+            }
+        };
+        // Audit the credential load (broker startup, in-process facade): the count
+        // and the names, never the secret values. Sorted, so one credential set
+        // gives one entry whatever the line order of the file.
+        let mut sorted_names = loaded.clone();
+        sorted_names.sort();
         self.audit(
             "vault",
             "credentials_loaded",
-            &serde_json::json!({ "count": loaded }),
+            &serde_json::json!({ "count": sorted_names.len(), "names": sorted_names }),
         );
         Ok(loaded)
     }
@@ -1275,6 +1299,78 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::operator::OperatorKey;
+
+    fn write_env(tag: &str, bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "cage-gate-env-{tag}-{}-{:?}.env",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn last_audit(g: &Gate) -> (String, serde_json::Value) {
+        let entry = g.audit_log_snapshot().pop().unwrap();
+        (entry.event, serde_json::from_str(&entry.data_json).unwrap())
+    }
+
+    #[test]
+    fn env_load_audits_sorted_names_and_returns_file_order() {
+        let path = write_env("sorted", b"BETA=b\nALPHA=a\n");
+        let mut g = Gate::new();
+        let names = ["ALPHA".to_string(), "BETA".to_string()];
+        let loaded = g.load_credentials_from_env(&path, &names);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            loaded.unwrap(),
+            vec!["BETA".to_string(), "ALPHA".to_string()]
+        );
+        let (event, data) = last_audit(&g);
+        assert_eq!(event, "credentials_loaded");
+        assert_eq!(
+            data,
+            serde_json::json!({ "count": 2, "names": ["ALPHA", "BETA"] })
+        );
+    }
+
+    #[test]
+    fn refused_env_load_is_audited_without_any_value() {
+        let path = write_env("refused", b"ALPHA=canary-one-7f3a\nALPHA=canary-two-9b1c\n");
+        let mut g = Gate::new();
+        let loaded = g.load_credentials_from_env(&path, &["ALPHA".to_string()]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(loaded.is_err());
+        assert!(!g.has_secret("ALPHA"));
+        let (event, data) = last_audit(&g);
+        assert_eq!(event, "credentials_load_refused");
+        assert_eq!(
+            data,
+            serde_json::json!({ "kind": "duplicate_name", "name": "ALPHA", "path": path })
+        );
+
+        let empty = write_env("empty", b"ALPHA=a\nBETA=\n");
+        let names = ["ALPHA".to_string(), "BETA".to_string()];
+        assert!(g.load_credentials_from_env(&empty, &names).is_err());
+        std::fs::remove_file(&empty).unwrap();
+        let (event, data) = last_audit(&g);
+        assert_eq!(event, "credentials_load_refused");
+        assert_eq!(
+            data,
+            serde_json::json!({ "kind": "empty_value", "line": 2, "path": empty })
+        );
+
+        let missing = format!("{path}.missing");
+        assert!(g
+            .load_credentials_from_env(&missing, &["ALPHA".to_string()])
+            .is_err());
+        let (event, data) = last_audit(&g);
+        assert_eq!(event, "credentials_load_refused");
+        assert_eq!(
+            data,
+            serde_json::json!({ "kind": "unreadable", "path": missing })
+        );
+    }
 
     /// Dev-mode gate (issuance/revocation need no bootstrap) for the tests that
     /// exercise signing / use-counting rather than the bootstrap gate itself.

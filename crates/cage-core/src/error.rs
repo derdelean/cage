@@ -17,6 +17,17 @@ pub enum CageError {
     BadAuditData(String),
     /// A whitelisted key appeared more than once in a `.env` file.
     DuplicateEnvKey { key: String, path: String },
+    /// A line of a `.env` file is not valid UTF-8. Carries the line number,
+    /// never the line.
+    EnvNotUtf8 { path: String, line: usize },
+    /// A line of a `.env` file was refused: `carriage_return` (a carriage
+    /// return inside the line) or `empty_value` (a whitelisted name with no
+    /// value). Carries the line number, never the line.
+    EnvLineRefused {
+        path: String,
+        line: usize,
+        kind: &'static str,
+    },
     /// Filesystem error reading an env file (the path is not itself secret).
     Io(String),
     /// Canonical-JSON serialization failure (attestation / audit).
@@ -41,6 +52,12 @@ impl std::fmt::Display for CageError {
             Self::BadAuditData(msg) => write!(f, "CAGE audit: bad data_json: {msg}"),
             Self::DuplicateEnvKey { key, path } => {
                 write!(f, "CAGE: duplicate key {key:?} in env file {path:?}")
+            }
+            Self::EnvNotUtf8 { path, line } => {
+                write!(f, "CAGE: env file {path:?} line {line} is not valid UTF-8")
+            }
+            Self::EnvLineRefused { path, line, kind } => {
+                write!(f, "CAGE: env file {path:?} line {line} refused: {kind}")
             }
             Self::Io(msg) => write!(f, "CAGE io: {msg}"),
             Self::Serialize(msg) => write!(f, "CAGE serialize: {msg}"),
