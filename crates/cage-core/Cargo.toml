@@ -17,7 +17,7 @@ subtle = "2.6"
 sha2 = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 base64 = "0.23"
 
 # HTTPS transport — rustls + tokio-rustls only; no reqwest/hyper.
